@@ -10,7 +10,7 @@
 //! so the overlay always reflects the current layout:
 //!   - `sidebar::show` → `state.add_btn_rect`
 //!   - `main_panel::show` → `state.launch_btn_rect`
-//!   - `app::show_add_dialog` → `state.cookie_field_rect`
+//!   - `app::show_add_dialog` → `state.browser_login_btn_rect`
 
 use eframe::egui;
 
@@ -24,8 +24,8 @@ pub enum TutorialStep {
     Welcome,
     /// Highlight the "Add Account" sidebar button. Advances when the dialog opens.
     AddAccount,
-    /// Highlight the cookie input inside the add-account dialog. Advances when
-    /// an account is successfully added.
+    /// Highlight the "Log in with browser" button inside the add-account dialog.
+    /// Advances when an account is successfully added (via either login method).
     EnterCookie,
     /// Highlight the sidebar account list. Advances when an account is selected.
     SelectAccount,
@@ -48,7 +48,7 @@ pub struct TutorialState {
     // Widget rects reported each frame by components.
     pub add_btn_rect: egui::Rect,
     pub launch_btn_rect: egui::Rect,
-    pub cookie_field_rect: egui::Rect,
+    pub browser_login_btn_rect: egui::Rect,
     pub sidebar_accounts_rect: egui::Rect,
 }
 
@@ -59,7 +59,7 @@ impl Default for TutorialState {
             step: TutorialStep::Welcome,
             add_btn_rect: egui::Rect::NOTHING,
             launch_btn_rect: egui::Rect::NOTHING,
-            cookie_field_rect: egui::Rect::NOTHING,
+            browser_login_btn_rect: egui::Rect::NOTHING,
             sidebar_accounts_rect: egui::Rect::NOTHING,
         }
     }
@@ -94,7 +94,7 @@ impl TutorialState {
     fn target_rect(&self) -> egui::Rect {
         match self.step {
             TutorialStep::AddAccount => self.add_btn_rect,
-            TutorialStep::EnterCookie => self.cookie_field_rect,
+            TutorialStep::EnterCookie => self.browser_login_btn_rect,
             TutorialStep::SelectAccount => self.sidebar_accounts_rect,
             TutorialStep::LaunchGame => self.launch_btn_rect,
             TutorialStep::Welcome | TutorialStep::Done => egui::Rect::NOTHING,
@@ -130,10 +130,9 @@ impl TutorialState {
                 true,
             ),
             TutorialStep::EnterCookie => (
-                "Enter your cookie",
-                "Paste your .ROBLOSECURITY cookie into the highlighted field, then \
-                 click Add. In Chrome: press F12, open Application > Cookies, \
-                 find .ROBLOSECURITY, and copy its value.",
+                "Sign in to Roblox",
+                "Click the highlighted button and sign in with your Roblox account. \
+                 RM will pick up your account automatically once you're signed in.",
                 false,
                 false,
             ),

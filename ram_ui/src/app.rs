@@ -1207,16 +1207,15 @@ impl AppState {
                         ui.add_space(10.0);
 
                         let full_w = ui.available_width();
-                        if ui
-                            .add_sized(
-                                [full_w, 48.0],
-                                egui::Button::new(
-                                    egui::RichText::new("🌐  Log in with browser")
-                                        .size(15.0),
-                                ),
-                            )
-                            .clicked()
-                        {
+                        let browser_btn_resp = ui.add_sized(
+                            [full_w, 48.0],
+                            egui::Button::new(
+                                egui::RichText::new("🌐  Log in with browser")
+                                    .size(15.0),
+                            ),
+                        );
+                        self.tutorial.browser_login_btn_rect = browser_btn_resp.rect;
+                        if browser_btn_resp.clicked() {
                             let (tx, rx) = std::sync::mpsc::channel();
                             let profile_dir = crate::data_dir().join("webview_profile");
                             // Wipe the profile between attempts so stale sessions don't leak.
@@ -1322,9 +1321,7 @@ impl AppState {
                                 .password(true)
                                 .desired_width(f32::INFINITY)
                                 .hint_text("_|WARNING:-DO-NOT-SHARE-THIS...");
-                        let cookie_resp =
-                            ui.add_enabled(!self.add_dialog.loading, cookie_edit);
-                        self.tutorial.cookie_field_rect = cookie_resp.rect;
+                        ui.add_enabled(!self.add_dialog.loading, cookie_edit);
                         if !self.add_dialog.cookie_input.is_empty() {
                             ui.label(
                                 egui::RichText::new(format!(

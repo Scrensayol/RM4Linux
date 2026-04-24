@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.4.1
+
+### Fixed
+- **First-launch tutorial** — step 3 now highlights the "Log in with browser" button and tells you to sign in with your Roblox account, instead of pointing at a cookie field that no longer exists on the first page of the Add Account dialog.
+
 ## v1.4.0
 
 ### Added
