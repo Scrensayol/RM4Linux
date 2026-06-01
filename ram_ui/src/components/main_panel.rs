@@ -489,7 +489,15 @@ pub fn show(
                         }
                     });
 
-                if account.cookie_expired {
+                // Skip the cookie-expired banner when there's an active
+                // moderation — the moderation banner already covers it, and
+                // "re-add with a fresh cookie" is misleading advice when
+                // Roblox has revoked the cookie as part of an enforcement.
+                let mod_active = account
+                    .moderation
+                    .as_ref()
+                    .is_some_and(|m| m.is_active());
+                if account.cookie_expired && !mod_active {
                     ui.add_space(6.0);
                     egui::Frame::default()
                         .fill(egui::Color32::from_rgb(80, 30, 30))

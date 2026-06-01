@@ -348,9 +348,13 @@ impl AppState {
                     display_name,
                     moderation,
                 } => {
-                    // Whether moderation flipped from None → Some this round.
+                    // Track transitions so we only toast on state changes
+                    // (every revalidation cycle re-emits the current state,
+                    // so toasting unconditionally spams the user).
                     let mut newly_moderated = false;
+                    let mut newly_expired = false;
                     if let Some(acc) = self.store.find_by_id_mut(user_id) {
+                        let was_expired = acc.cookie_expired;
                         if valid {
                             acc.last_validated = Some(chrono::Utc::now());
                             acc.username = username;
@@ -358,6 +362,7 @@ impl AppState {
                             acc.cookie_expired = false;
                         } else {
                             acc.cookie_expired = true;
+                            newly_expired = !was_expired;
                         }
                         let was_active =
                             acc.moderation.as_ref().is_some_and(|m| m.is_active());
@@ -396,18 +401,11 @@ impl AppState {
                         };
                     }
                     self.auto_save();
-                    if !valid {
-                        if let Some(acc) = self.store.find_by_id(user_id) {
-                            let label = if self.config.anonymize_names {
-                                "An account".to_string()
-                            } else {
-                                acc.label().to_string()
-                            };
-                            self.toasts.push(Toast::error(format!(
-                                "Cookie expired for {label}. Re-add with a fresh cookie."
-                            )));
-                        }
-                    }
+                    // Toast on state transitions only, and never duplicate
+                    // "cookie expired" with the moderation toast — for a
+                    // terminated account the cookie revocation is implied
+                    // by the moderation itself, so the moderation toast
+                    // alone is correct.
                     if newly_moderated {
                         if let Some(acc) = self.store.find_by_id(user_id) {
                             let label = if self.config.anonymize_names {
@@ -418,6 +416,25 @@ impl AppState {
                             self.toasts.push(Toast::error(format!(
                                 "{label} has been moderated. See the account panel for details."
                             )));
+                        }
+                    } else if newly_expired {
+                        if let Some(acc) = self.store.find_by_id(user_id) {
+                            // Skip the "cookie expired" toast entirely for
+                            // accounts we know are moderated — Roblox revokes
+                            // the cookie as part of the enforcement, so the
+                            // "re-add with a fresh cookie" advice is wrong.
+                            let is_moderated =
+                                acc.moderation.as_ref().is_some_and(|m| m.is_active());
+                            if !is_moderated {
+                                let label = if self.config.anonymize_names {
+                                    "An account".to_string()
+                                } else {
+                                    acc.label().to_string()
+                                };
+                                self.toasts.push(Toast::error(format!(
+                                    "Cookie expired for {label}. Re-add with a fresh cookie."
+                                )));
+                            }
                         }
                     }
                 }
