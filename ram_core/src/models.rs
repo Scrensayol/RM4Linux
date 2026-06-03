@@ -164,6 +164,12 @@ pub struct AppConfig {
     /// Always active when multi-instance is enabled; can also be used standalone.
     #[serde(default)]
     pub kill_background_roblox: bool,
+    /// Minimum seconds between successive account launches. Applied to both
+    /// single launches (UI gates the click) and bulk launches (sleeps between
+    /// iterations). 0 = no throttling. Roblox rate-limits aggressive launching
+    /// from some IPs, so users on those IPs set this to a safe interval.
+    #[serde(default)]
+    pub launch_delay_secs: u32,
     /// Custom Roblox player install path override.
     pub roblox_player_path: Option<PathBuf>,
     /// Saved window dimensions.
@@ -217,6 +223,7 @@ impl Default for AppConfig {
             use_credential_manager: false,
             multi_instance_enabled: false,
             kill_background_roblox: false,
+            launch_delay_secs: 0,
             roblox_player_path: None,
             window_width: 960.0,
             window_height: 640.0,

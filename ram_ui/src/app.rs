@@ -12,6 +12,22 @@ use crate::components::{
 };
 use crate::toast::{Toast, Toasts};
 
+/// Produce a blurred PNG of an avatar for anonymize mode. Returns `None` if
+/// the input couldn't be decoded or re-encoded. Box blur (`fast_blur`) is
+/// chosen over Gaussian because avatars are tiny and the speed difference is
+/// imperceptible to the user but matters when toggling anonymize on a store
+/// with many accounts.
+fn anonymize_avatar(bytes: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let blurred = image::imageops::fast_blur(&rgba, 20.0);
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(blurred)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
 // ---------------------------------------------------------------------------
 // Tabs
 // ---------------------------------------------------------------------------
@@ -38,6 +54,8 @@ enum AddAccountStep {
     Browser,
     /// Manual `.ROBLOSECURITY` paste.
     Manual,
+    /// Bulk import — paste many cookies at once.
+    Bulk,
 }
 
 #[derive(Default)]
@@ -67,6 +85,33 @@ struct AddAccountDialog {
     force_add_form_open: bool,
     /// Username buffer for the "add anyway" form.
     force_add_username: String,
+
+    // --- Bulk-import state ---
+    /// Multiline paste buffer for the bulk step.
+    bulk_input: String,
+    /// Cookies still queued for dispatch. We send them one at a time (each
+    /// AccountValidated/Error/AuthFailed advances the queue) to avoid hitting
+    /// Roblox rate limits with parallel validate_cookie calls. Stored in
+    /// reverse so `pop()` yields paste order.
+    bulk_queue: Vec<String>,
+    bulk_total: usize,
+    bulk_succeeded: usize,
+    bulk_failed: usize,
+    /// True from "Import" click until the user closes the summary screen.
+    bulk_running: bool,
+}
+
+/// Parse a bulk-paste buffer into individual cookies. Splits on newlines,
+/// commas, semicolons, and tabs so that newline-delimited lists, CSV, and
+/// TSV all work without the user having to pick a format up front. Empty
+/// tokens are dropped and surrounding quotes/whitespace are trimmed.
+fn parse_bulk_cookies(input: &str) -> Vec<String> {
+    input
+        .split(|c: char| matches!(c, '\n' | '\r' | ',' | ';' | '\t'))
+        .map(|s| s.trim().trim_matches('"').trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Snapshot of an about-to-be-added account that the user must confirm because
@@ -107,6 +152,11 @@ pub struct AppState {
     /// Downloaded avatar image bytes, keyed by user ID.
     avatar_bytes: HashMap<u64, Vec<u8>>,
 
+    /// Blurred variants of `avatar_bytes` for anonymize mode. Computed lazily
+    /// each update() so each avatar is blurred at most once. Invalidated when
+    /// the underlying avatar refreshes so the next pass re-blurs from source.
+    anonymized_avatar_bytes: HashMap<u64, Vec<u8>>,
+
     /// Downloaded game icon bytes, keyed by place ID.
     game_icon_bytes: HashMap<u64, Vec<u8>>,
 
@@ -121,6 +171,10 @@ pub struct AppState {
     /// don't fire reliably in eframe's reactive mode (update() only runs on
     /// input), so periodic background work uses real time instead.
     last_tray_kill: Option<std::time::Instant>,
+    /// Wall-clock timestamp of the last user-initiated game launch. Used to
+    /// enforce `config.launch_delay_secs` so the user can't trigger another
+    /// single/quick launch inside the cooldown window.
+    last_launch: Option<std::time::Instant>,
 
     /// Password prompt shown on first launch when store file exists.
     needs_unlock: bool,
@@ -186,11 +240,13 @@ impl AppState {
             presets: Vec::new(),
             presets_dir: ram_core::presets::presets_dir(&crate::data_dir()),
             avatar_bytes: HashMap::new(),
+            anonymized_avatar_bytes: HashMap::new(),
             game_icon_bytes: HashMap::new(),
             visible_user_ids: Vec::new(),
             roblox_running: false,
             frame_count: 0,
             last_tray_kill: None,
+            last_launch: None,
             needs_unlock,
             unlock_password_input: String::new(),
             confirm_remove: None,
@@ -234,6 +290,18 @@ impl AppState {
     fn process_events(&mut self) {
         for event in self.bridge.poll() {
             match event {
+                BackendEvent::AccountValidated {
+                    account,
+                    encrypted_cookie: _encrypted_cookie_bulk,
+                } if self.add_dialog.bulk_running => {
+                    // Bulk import — skip the moderation confirm prompt. The
+                    // user opted into batch processing, so moderated accounts
+                    // are added silently and can be reviewed afterward.
+                    self.store.remove_by_id(account.user_id);
+                    self.store.accounts.push(*account);
+                    self.add_dialog.bulk_succeeded += 1;
+                    self.dispatch_next_bulk();
+                }
                 BackendEvent::AccountValidated {
                     account,
                     encrypted_cookie,
@@ -290,6 +358,9 @@ impl AppState {
                 BackendEvent::AvatarImagesReady(images) => {
                     for (id, bytes) in images {
                         self.avatar_bytes.insert(id, bytes);
+                        // Drop the cached blur so the next update() re-blurs
+                        // from the fresh source.
+                        self.anonymized_avatar_bytes.remove(&id);
                     }
                 }
                 BackendEvent::PresencesUpdated(presences) => {
@@ -439,12 +510,20 @@ impl AppState {
                     }
                 }
                 BackendEvent::Error(msg) => {
-                    // If the add dialog is loading, show error there for retry
-                    if self.add_dialog.loading {
-                        self.add_dialog.loading = false;
-                        self.add_dialog.last_error = Some(msg.clone());
+                    if self.add_dialog.bulk_running {
+                        // Don't toast or block the dialog mid-batch — count
+                        // the failure and move on. The summary screen reports
+                        // the totals.
+                        self.add_dialog.bulk_failed += 1;
+                        self.dispatch_next_bulk();
+                    } else {
+                        // If the add dialog is loading, show error there for retry
+                        if self.add_dialog.loading {
+                            self.add_dialog.loading = false;
+                            self.add_dialog.last_error = Some(msg.clone());
+                        }
+                        self.toasts.push(Toast::error(msg));
                     }
-                    self.toasts.push(Toast::error(msg));
                 }
                 BackendEvent::UpdateAvailable { version, url } => {
                     self.update_available = Some((version, url));
@@ -526,20 +605,27 @@ impl AppState {
                     cookie,
                     moderation_message,
                 } => {
-                    // The validate step rejected the cookie. Most often this
-                    // means the account was terminated (cookie revoked) but
-                    // it could also be an expired or malformed cookie. Surface
-                    // a clearer message + stash the rejected cookie so the
-                    // dialog can offer "Open browser as" to investigate.
-                    self.add_dialog.loading = false;
-                    let msg = match moderation_message {
-                        Some(m) => format!(
-                            "Cookie was rejected by Roblox.\n\nLikely reason: {m}",
-                        ),
-                        None => "Cookie was rejected by Roblox. The account may be terminated, the cookie may be expired, or you may need to log in again.".to_string(),
-                    };
-                    self.add_dialog.last_error = Some(msg);
-                    self.add_dialog.rejected_cookie = Some(cookie);
+                    if self.add_dialog.bulk_running {
+                        // Rejected cookie in a batch — count it and move on.
+                        // The user can re-run individual paths for failures.
+                        self.add_dialog.bulk_failed += 1;
+                        self.dispatch_next_bulk();
+                    } else {
+                        // The validate step rejected the cookie. Most often this
+                        // means the account was terminated (cookie revoked) but
+                        // it could also be an expired or malformed cookie. Surface
+                        // a clearer message + stash the rejected cookie so the
+                        // dialog can offer "Open browser as" to investigate.
+                        self.add_dialog.loading = false;
+                        let msg = match moderation_message {
+                            Some(m) => format!(
+                                "Cookie was rejected by Roblox.\n\nLikely reason: {m}",
+                            ),
+                            None => "Cookie was rejected by Roblox. The account may be terminated, the cookie may be expired, or you may need to log in again.".to_string(),
+                        };
+                        self.add_dialog.last_error = Some(msg);
+                        self.add_dialog.rejected_cookie = Some(cookie);
+                    }
                 }
             }
         }
@@ -552,6 +638,30 @@ impl AppState {
                 path: self.config.accounts_path.clone(),
                 password: self.master_password.clone(),
             });
+        }
+    }
+
+    /// Pop the next queued cookie and dispatch an AddAccount for it. When the
+    /// queue is empty the batch is done: save once, refresh avatars/presence
+    /// for the newly added accounts, and clear the loading flag so the bulk
+    /// summary screen renders.
+    fn dispatch_next_bulk(&mut self) {
+        match self.add_dialog.bulk_queue.pop() {
+            Some(cookie) => {
+                self.add_dialog.loading = true;
+                self.bridge.send(BackendCommand::AddAccount {
+                    cookie,
+                    password: self.master_password.clone(),
+                    use_credential_manager: self.config.use_credential_manager,
+                });
+            }
+            None => {
+                self.add_dialog.loading = false;
+                if self.add_dialog.bulk_succeeded > 0 {
+                    self.auto_save();
+                    self.trigger_refresh();
+                }
+            }
         }
     }
 
@@ -632,6 +742,33 @@ impl AppState {
 
     /// Dispatch a "browse as" request: decrypt the cookie on the backend and
     /// spawn a fresh webview window pre-logged-in as the account.
+    /// Gate a single user-initiated launch through the configured launch
+    /// delay. Returns `true` and updates `last_launch` if the launch may
+    /// proceed; returns `false` and shows a "wait Xs" toast otherwise.
+    /// Bulk launches don't go through this — the backend handles their
+    /// pacing internally so the UI can fire-and-forget the whole batch.
+    fn try_consume_launch_slot(&mut self) -> bool {
+        let delay = self.config.launch_delay_secs;
+        if delay == 0 {
+            self.last_launch = Some(std::time::Instant::now());
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_launch {
+            let elapsed = now.duration_since(last);
+            let needed = std::time::Duration::from_secs(delay as u64);
+            if elapsed < needed {
+                let remaining = (needed - elapsed).as_secs() + 1;
+                self.toasts.push(Toast::info(format!(
+                    "Launch cooldown: wait {remaining}s",
+                )));
+                return false;
+            }
+        }
+        self.last_launch = Some(now);
+        true
+    }
+
     fn open_browser_as(&mut self, user_id: u64) {
         let Some(account) = self.store.find_by_id(user_id) else {
             return;
@@ -694,6 +831,25 @@ impl eframe::App for AppState {
         // Ensure the bridge can wake the UI when async events arrive.
         self.bridge.set_repaint_ctx(ctx.clone());
         self.process_events();
+
+        // Top up the blurred-avatar cache for anonymize mode. No-op once
+        // every visible avatar already has its blur computed; on first toggle
+        // or after a fresh fetch this fills in the gap.
+        if self.config.anonymize_names {
+            let needs: Vec<u64> = self
+                .avatar_bytes
+                .keys()
+                .filter(|id| !self.anonymized_avatar_bytes.contains_key(id))
+                .copied()
+                .collect();
+            for id in needs {
+                if let Some(orig) = self.avatar_bytes.get(&id) {
+                    if let Some(blurred) = anonymize_avatar(orig) {
+                        self.anonymized_avatar_bytes.insert(id, blurred);
+                    }
+                }
+            }
+        }
 
         // Periodically refresh roblox_running flag (every ~120 frames ≈ 2s)
         if self.frame_count.is_multiple_of(120) {
@@ -848,6 +1004,11 @@ impl AppState {
             .width_range(140.0..=400.0)
             .resizable(true)
             .show(ctx, |ui| {
+                let avatars = if self.config.anonymize_names {
+                    &self.anonymized_avatar_bytes
+                } else {
+                    &self.avatar_bytes
+                };
                 let result = sidebar::show(
                     ui,
                     &mut self.sidebar_state,
@@ -855,7 +1016,7 @@ impl AppState {
                     &self.selected_ids,
                     self.config.anonymize_names,
                     &self.config.groups,
-                    &self.avatar_bytes,
+                    avatars,
                 );
                 self.visible_user_ids = result.visible_user_ids;
                 self.tutorial.add_btn_rect = result.add_btn_rect;
@@ -927,20 +1088,26 @@ impl AppState {
                                     (pid, j)
                                 });
                             if let Some(place_id) = place_id {
-                                if let Some(acc) = self.store.find_by_id(user_id) {
-                                    self.bridge.send(BackendCommand::LaunchGameEncrypted {
-                                        user_id: acc.user_id,
-                                        encrypted_cookie: acc.encrypted_cookie.clone(),
-                                        password: self.master_password.clone(),
-                                        use_credential_manager: self.config.use_credential_manager,
-                                        place_id,
-                                        job_id,
-                                        link_code: None,
-                                        access_code: None,
-                                        multi_instance: self.config.multi_instance_enabled,
-                                        kill_background: self.config.kill_background_roblox,
-                                        privacy_mode: self.config.privacy_mode,
-                                    });
+                                let acc_lookup = self
+                                    .store
+                                    .find_by_id(user_id)
+                                    .map(|a| (a.user_id, a.encrypted_cookie.clone()));
+                                if let Some((uid, enc)) = acc_lookup {
+                                    if self.try_consume_launch_slot() {
+                                        self.bridge.send(BackendCommand::LaunchGameEncrypted {
+                                            user_id: uid,
+                                            encrypted_cookie: enc,
+                                            password: self.master_password.clone(),
+                                            use_credential_manager: self.config.use_credential_manager,
+                                            place_id,
+                                            job_id,
+                                            link_code: None,
+                                            access_code: None,
+                                            multi_instance: self.config.multi_instance_enabled,
+                                            kill_background: self.config.kill_background_roblox,
+                                            privacy_mode: self.config.privacy_mode,
+                                        });
+                                    }
                                 }
                             } else {
                                 self.toasts.push(Toast::error(
@@ -1125,6 +1292,7 @@ impl AppState {
                                 multi_instance: self.config.multi_instance_enabled,
                                 kill_background: self.config.kill_background_roblox,
                                 privacy_mode: self.config.privacy_mode,
+                                launch_delay_secs: self.config.launch_delay_secs,
                             });
                         }
                         group_panel::GroupPanelAction::ClearSelection => {
@@ -1139,7 +1307,11 @@ impl AppState {
                 let id = *self.selected_ids.iter().next().unwrap();
                 let account = self.store.find_by_id(id).cloned();
                 if let Some(account) = account {
-                    let avatar_bytes = self.avatar_bytes.get(&account.user_id);
+                    let avatar_bytes = if self.config.anonymize_names {
+                        self.anonymized_avatar_bytes.get(&account.user_id)
+                    } else {
+                        self.avatar_bytes.get(&account.user_id)
+                    };
                     let preset_view: Vec<ram_core::models::LaunchPreset> =
                         self.presets.iter().map(|(_, p)| p.clone()).collect();
                     let result = main_panel::show(
@@ -1155,19 +1327,21 @@ impl AppState {
                     if let Some(a) = result.action {
                         match a {
                             main_panel::MainPanelAction::LaunchGame { place_id, job_id } => {
-                                self.bridge.send(BackendCommand::LaunchGameEncrypted {
-                                    user_id: account.user_id,
-                                    encrypted_cookie: account.encrypted_cookie.clone(),
-                                    password: self.master_password.clone(),
-                                    use_credential_manager: self.config.use_credential_manager,
-                                    place_id,
-                                    job_id,
-                                    link_code: None,
-                                    access_code: None,
-                                    multi_instance: self.config.multi_instance_enabled,
-                                    kill_background: self.config.kill_background_roblox,
-                                    privacy_mode: self.config.privacy_mode,
-                                });
+                                if self.try_consume_launch_slot() {
+                                    self.bridge.send(BackendCommand::LaunchGameEncrypted {
+                                        user_id: account.user_id,
+                                        encrypted_cookie: account.encrypted_cookie.clone(),
+                                        password: self.master_password.clone(),
+                                        use_credential_manager: self.config.use_credential_manager,
+                                        place_id,
+                                        job_id,
+                                        link_code: None,
+                                        access_code: None,
+                                        multi_instance: self.config.multi_instance_enabled,
+                                        kill_background: self.config.kill_background_roblox,
+                                        privacy_mode: self.config.privacy_mode,
+                                    });
+                                }
                             }
                             main_panel::MainPanelAction::RemoveAccount(uid) => {
                                 self.confirm_remove = Some(uid);
@@ -1279,20 +1453,26 @@ impl AppState {
                         let ac = if access_code.is_empty() { None } else { Some(access_code.clone()) };
                         if self.selected_ids.len() == 1 {
                             let uid = *self.selected_ids.iter().next().unwrap();
-                            if let Some(acc) = self.store.find_by_id(uid) {
-                                self.bridge.send(BackendCommand::LaunchGameEncrypted {
-                                    user_id: acc.user_id,
-                                    encrypted_cookie: acc.encrypted_cookie.clone(),
-                                    password: self.master_password.clone(),
-                                    use_credential_manager: self.config.use_credential_manager,
-                                    place_id,
-                                    job_id: None,
-                                    link_code: Some(link_code.clone()),
-                                    access_code: ac.clone(),
-                                    multi_instance: self.config.multi_instance_enabled,
-                                    kill_background: self.config.kill_background_roblox,
-                                    privacy_mode: self.config.privacy_mode,
-                                });
+                            let acc_lookup = self
+                                .store
+                                .find_by_id(uid)
+                                .map(|a| (a.user_id, a.encrypted_cookie.clone()));
+                            if let Some((user_id, enc)) = acc_lookup {
+                                if self.try_consume_launch_slot() {
+                                    self.bridge.send(BackendCommand::LaunchGameEncrypted {
+                                        user_id,
+                                        encrypted_cookie: enc,
+                                        password: self.master_password.clone(),
+                                        use_credential_manager: self.config.use_credential_manager,
+                                        place_id,
+                                        job_id: None,
+                                        link_code: Some(link_code.clone()),
+                                        access_code: ac.clone(),
+                                        multi_instance: self.config.multi_instance_enabled,
+                                        kill_background: self.config.kill_background_roblox,
+                                        privacy_mode: self.config.privacy_mode,
+                                    });
+                                }
                             }
                         } else if self.selected_ids.len() > 1 {
                             let accounts: Vec<(u64, Option<String>)> = self
@@ -1313,6 +1493,7 @@ impl AppState {
                                 multi_instance: self.config.multi_instance_enabled,
                                 kill_background: self.config.kill_background_roblox,
                                 privacy_mode: self.config.privacy_mode,
+                                launch_delay_secs: self.config.launch_delay_secs,
                             });
                         }
                     }
@@ -1806,13 +1987,31 @@ impl AppState {
                             self.add_dialog.step = AddAccountStep::Manual;
                             self.add_dialog.last_error = None;
                         }
+                        ui.add_space(6.0);
+                        if ui
+                            .add_sized(
+                                [full_w, 48.0],
+                                egui::Button::new(
+                                    egui::RichText::new("📥  Bulk import")
+                                        .size(15.0),
+                                ),
+                            )
+                            .on_hover_text(
+                                "Paste many cookies at once, one per line or comma-separated",
+                            )
+                            .clicked()
+                        {
+                            self.add_dialog.step = AddAccountStep::Bulk;
+                            self.add_dialog.last_error = None;
+                            self.add_dialog.bulk_input.clear();
+                        }
                     }
 
                     AddAccountStep::Browser => {
                         if ui
                             .add_enabled(
                                 !self.add_dialog.loading,
-                                egui::Button::new("\u{2190} Back").small(),
+                                egui::Button::new("Back").small(),
                             )
                             .clicked()
                         {
@@ -1854,7 +2053,7 @@ impl AppState {
                         if ui
                             .add_enabled(
                                 !self.add_dialog.loading,
-                                egui::Button::new("\u{2190} Back").small(),
+                                egui::Button::new("Back").small(),
                             )
                             .clicked()
                         {
@@ -1864,22 +2063,200 @@ impl AppState {
                         }
                         ui.add_space(8.0);
 
-                        // Single-line password field — cookies are credential
-                        // material and can be ~2000 chars; this keeps the dialog
-                        // compact and the raw value off-screen.
+                        // Multiline because long cookies (~2000 chars) make a
+                        // singleline TextEdit oscillate width frame-to-frame.
+                        // password(true) still masks the value as dots.
                         let cookie_edit =
-                            egui::TextEdit::singleline(&mut self.add_dialog.cookie_input)
+                            egui::TextEdit::multiline(&mut self.add_dialog.cookie_input)
                                 .password(true)
                                 .desired_width(f32::INFINITY)
                                 .hint_text("Paste your .ROBLOSECURITY cookie");
                         ui.add_enabled(!self.add_dialog.loading, cookie_edit);
                         ui.add_space(8.0);
                     }
+
+                    AddAccountStep::Bulk => {
+                        let busy = self.add_dialog.bulk_running
+                            && (self.add_dialog.bulk_succeeded
+                                + self.add_dialog.bulk_failed)
+                                < self.add_dialog.bulk_total;
+
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new("Back").small(),
+                            )
+                            .clicked()
+                        {
+                            self.add_dialog.step = AddAccountStep::Choose;
+                            self.add_dialog.bulk_input.clear();
+                            self.add_dialog.bulk_running = false;
+                            self.add_dialog.bulk_queue.clear();
+                            self.add_dialog.bulk_total = 0;
+                            self.add_dialog.bulk_succeeded = 0;
+                            self.add_dialog.bulk_failed = 0;
+                            self.add_dialog.last_error = None;
+                        }
+                        ui.add_space(8.0);
+
+                        if self.add_dialog.bulk_running {
+                            let done = self.add_dialog.bulk_succeeded
+                                + self.add_dialog.bulk_failed;
+                            let total = self.add_dialog.bulk_total;
+                            if done < total {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(format!(
+                                        "Importing {done}/{total}...",
+                                    ));
+                                });
+                            } else {
+                                ui.label(format!(
+                                    "Done: {} added, {} failed.",
+                                    self.add_dialog.bulk_succeeded,
+                                    self.add_dialog.bulk_failed,
+                                ));
+                                ui.add_space(8.0);
+                                if ui.button("Close").clicked() {
+                                    self.add_dialog.open = false;
+                                    self.add_dialog.bulk_running = false;
+                                    self.add_dialog.bulk_input.clear();
+                                    self.add_dialog.bulk_queue.clear();
+                                    self.add_dialog.bulk_total = 0;
+                                    self.add_dialog.bulk_succeeded = 0;
+                                    self.add_dialog.bulk_failed = 0;
+                                    self.add_dialog.step = AddAccountStep::Choose;
+                                }
+                            }
+                        } else {
+                            ui.label(
+                                "Paste one cookie per line, or comma-separated:",
+                            );
+                            ui.add_space(4.0);
+                            if ui
+                                .button("\u{1f4c2}  Browse file...")
+                                .on_hover_text(
+                                    "Load cookies from a .txt or .csv file",
+                                )
+                                .clicked()
+                            {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Text/CSV", &["txt", "csv", "tsv"])
+                                    .add_filter("All files", &["*"])
+                                    .pick_file()
+                                {
+                                    match std::fs::read_to_string(&path) {
+                                        Ok(contents) => {
+                                            // Append rather than replace so the user can
+                                            // combine multiple sources without losing prior paste.
+                                            if !self.add_dialog.bulk_input.is_empty()
+                                                && !self
+                                                    .add_dialog
+                                                    .bulk_input
+                                                    .ends_with('\n')
+                                            {
+                                                self.add_dialog.bulk_input.push('\n');
+                                            }
+                                            self.add_dialog.bulk_input.push_str(&contents);
+                                        }
+                                        Err(e) => {
+                                            self.toasts.push(Toast::error(format!(
+                                                "Failed to read {}: {e}",
+                                                path.display(),
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::TextEdit::multiline(
+                                    &mut self.add_dialog.bulk_input,
+                                )
+                                .password(true)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(8)
+                                .hint_text(
+                                    "Paste .ROBLOSECURITY cookies",
+                                ),
+                            );
+                            let count = parse_bulk_cookies(
+                                &self.add_dialog.bulk_input,
+                            )
+                            .len();
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{count} cookie(s) detected",
+                                ))
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                            ui.add_space(8.0);
+
+                            let needs_password = !self
+                                .config
+                                .use_credential_manager
+                                && self.master_password.is_empty();
+                            if needs_password {
+                                ui.label(
+                                    "Set a master password for encryption:",
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(
+                                        &mut self.add_dialog.password_input,
+                                    )
+                                    .password(true)
+                                    .hint_text("Master password"),
+                                );
+                                ui.add_space(4.0);
+                            }
+
+                            let valid = count > 0
+                                && (!needs_password
+                                    || !self
+                                        .add_dialog
+                                        .password_input
+                                        .is_empty());
+                            if ui
+                                .add_enabled(
+                                    valid,
+                                    egui::Button::new(format!(
+                                        "Import {count} account(s)",
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                let mut cookies = parse_bulk_cookies(
+                                    &self.add_dialog.bulk_input,
+                                );
+                                // Reverse so pop() yields paste order.
+                                cookies.reverse();
+                                if needs_password {
+                                    self.master_password = self
+                                        .add_dialog
+                                        .password_input
+                                        .clone();
+                                }
+                                self.add_dialog.bulk_total = cookies.len();
+                                self.add_dialog.bulk_succeeded = 0;
+                                self.add_dialog.bulk_failed = 0;
+                                self.add_dialog.bulk_queue = cookies;
+                                self.add_dialog.bulk_running = true;
+                                self.add_dialog.last_error = None;
+                                self.dispatch_next_bulk();
+                            }
+                        }
+                    }
                 }
 
                 // Shared footer — master password (if needed), error, submit.
-                // Skipped on the Choose step since there's nothing to submit yet.
-                if self.add_dialog.step == AddAccountStep::Choose {
+                // Skipped on Choose (nothing to submit) and Bulk (handles its
+                // own submit/progress UI above).
+                if matches!(
+                    self.add_dialog.step,
+                    AddAccountStep::Choose | AddAccountStep::Bulk
+                ) {
                     return;
                 }
 

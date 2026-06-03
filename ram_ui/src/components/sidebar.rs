@@ -729,8 +729,13 @@ fn render_account_row(
         egui::pos2(rect.min.x + 6.0, rect.min.y + avatar_pad),
         egui::vec2(avatar_size, avatar_size),
     );
-    if let Some(bytes) = avatar_bytes.get(&account.user_id).filter(|_| !anonymize) {
-        let uri = format!("bytes://sidebar_avatar/{}.png", account.user_id);
+    // The caller decides which avatar map to pass (originals vs blurred), so
+    // we just render whatever bytes are present. The URI gets an "anon"
+    // discriminator so egui's image cache doesn't serve the wrong variant
+    // when the user toggles anonymize.
+    if let Some(bytes) = avatar_bytes.get(&account.user_id) {
+        let variant = if anonymize { "anon" } else { "raw" };
+        let uri = format!("bytes://sidebar_avatar/{}_{}.png", variant, account.user_id);
         egui::Image::from_bytes(uri, bytes.clone())
             .rounding(egui::Rounding::same(avatar_size / 2.0))
             .paint_at(ui, avatar_rect);
@@ -743,7 +748,7 @@ fn render_account_row(
         ui.painter().text(
             avatar_rect.center(),
             egui::Align2::CENTER_CENTER,
-            if anonymize { "?" } else { "…" },
+            "…",
             egui::FontId::proportional(avatar_size * 0.45),
             egui::Color32::from_rgb(160, 160, 170),
         );

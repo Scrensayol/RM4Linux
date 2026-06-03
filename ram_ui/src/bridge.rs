@@ -106,6 +106,9 @@ pub enum BackendCommand {
         multi_instance: bool,
         kill_background: bool,
         privacy_mode: bool,
+        /// Seconds to wait between launches (Roblox rate-limit avoidance).
+        /// 0 = no extra delay beyond the existing tray-kill window.
+        launch_delay_secs: u32,
     },
     /// Re-validate all accounts' cookies automatically.
     RevalidateAll {
@@ -589,6 +592,7 @@ async fn handle_command(
             multi_instance,
             kill_background,
             privacy_mode,
+            launch_delay_secs,
         } => {
             if multi_instance {
                 process::enable_multi_instance()?;
@@ -685,10 +689,21 @@ async fn handle_command(
                     launched: i + 1,
                     total,
                 });
-                // Kill tray processes that spawn between launches
-                if (kill_background || multi_instance) && i + 1 < total {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    process::kill_tray_roblox();
+                // Inter-launch pacing: the user-configured throttle plus the
+                // existing 3s tray-kill window (which is also a de-facto
+                // launch delay). Pick the larger of the two so the user's
+                // setting always wins when they want a longer cooldown.
+                if i + 1 < total {
+                    let user_delay = launch_delay_secs as u64;
+                    let needs_tray_kill = kill_background || multi_instance;
+                    let tray_window: u64 = if needs_tray_kill { 3 } else { 0 };
+                    let wait = user_delay.max(tray_window);
+                    if wait > 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                    }
+                    if needs_tray_kill {
+                        process::kill_tray_roblox();
+                    }
                 }
             }
             Ok(BackendEvent::BulkLaunchComplete { launched, failed })

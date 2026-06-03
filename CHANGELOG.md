@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.4
+
+### Added
+- **Bulk import** under Add Account: paste many cookies (newline, comma, semicolon, or tab separated) or browse a `.txt` / `.csv` file. Moderated accounts get added silently; failures are counted in a summary screen.
+- **Launch delay** setting in seconds. Throttles single and bulk launches for users on Roblox-rate-limited IPs.
+- **Blurred avatars in anonymize mode**, replacing the prior hide-entirely placeholder so accounts stay visually distinguishable.
+
+### Fixed
+- **Cookie input flicker** on long pastes. The Add Account field is now multi-line.
+- **Empty-box Back button** in the Add Account dialog. The bundled font didn't ship the arrow glyph; the buttons now read plain "Back".
+- **Preset chips with duplicate names** registered every click against the first chip. Each chip now gets a unique widget ID.
+
 ## v1.4.3
 
 ### Fixed

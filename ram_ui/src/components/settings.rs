@@ -101,6 +101,27 @@ pub fn show(
             &mut config.auto_arrange_windows,
             "Auto-arrange Roblox windows after launch",
         ).on_hover_text("Tiles Roblox windows in a grid (2 = side-by-side, 4 = 2×2, etc.).");
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Launch delay:");
+            let mut secs = config.launch_delay_secs as i32;
+            ui.add(
+                egui::DragValue::new(&mut secs)
+                    .range(0..=300)
+                    .speed(0.2)
+                    .suffix(" s"),
+            )
+            .on_hover_text(
+                "Minimum gap between account launches. Applies to single and bulk launches. 0 disables throttling.",
+            );
+            config.launch_delay_secs = secs.max(0) as u32;
+            ui.label(
+                egui::RichText::new("(Roblox rate-limits some IPs)")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        });
     });
     ui.add_space(6.0);
 

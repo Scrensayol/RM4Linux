@@ -74,7 +74,7 @@ pub fn show(
             section_frame.show(ui, |ui: &mut egui::Ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    draw_avatar(ui, account.user_id, avatar_bytes, 80.0);
+                    draw_avatar(ui, account.user_id, avatar_bytes, 80.0, anonymize);
                     ui.add_space(8.0);
 
                     ui.vertical(|ui| {
@@ -228,20 +228,26 @@ pub fn show(
                             egui::RichText::new("Presets")
                                 .color(ui.visuals().weak_text_color()),
                         );
-                        for preset in presets {
-                            let btn = ui.small_button(&preset.name).on_hover_text(
-                                match &preset.job_id {
-                                    Some(j) if !j.is_empty() => {
-                                        format!("Place {}, Job {}", preset.place_id, j)
-                                    }
-                                    _ => format!("Place {}", preset.place_id),
-                                },
-                            );
-                            if btn.clicked() {
-                                state.place_id_input = preset.place_id.to_string();
-                                state.job_id_input =
-                                    preset.job_id.clone().unwrap_or_default();
-                            }
+                        for (i, preset) in presets.iter().enumerate() {
+                            // push_id disambiguates buttons that share a
+                            // label — without it egui hashes by label alone
+                            // and clicks on later chips register against
+                            // the first matching one.
+                            ui.push_id(i, |ui| {
+                                let btn = ui.small_button(&preset.name).on_hover_text(
+                                    match &preset.job_id {
+                                        Some(j) if !j.is_empty() => {
+                                            format!("Place {}, Job {}", preset.place_id, j)
+                                        }
+                                        _ => format!("Place {}", preset.place_id),
+                                    },
+                                );
+                                if btn.clicked() {
+                                    state.place_id_input = preset.place_id.to_string();
+                                    state.job_id_input =
+                                        preset.job_id.clone().unwrap_or_default();
+                                }
+                            });
                         }
                     });
                     ui.add_space(8.0);
@@ -550,15 +556,20 @@ pub fn show_empty(ui: &mut egui::Ui) {
 // ---------------------------------------------------------------------------
 
 /// Render an account avatar from cached bytes or a placeholder of the same size.
+/// `anonymize` only flips the URI discriminator so egui's image cache doesn't
+/// serve the wrong variant when the toggle changes; the caller is responsible
+/// for handing us the already-blurred bytes when anonymize is on.
 fn draw_avatar(
     ui: &mut egui::Ui,
     user_id: u64,
     bytes: Option<&Vec<u8>>,
     size: f32,
+    anonymize: bool,
 ) {
     let sz = egui::vec2(size, size);
     if let Some(bytes) = bytes {
-        let uri = format!("bytes://avatar/{user_id}.png");
+        let variant = if anonymize { "anon" } else { "raw" };
+        let uri = format!("bytes://avatar/{variant}_{user_id}.png");
         ui.add(
             egui::Image::from_bytes(uri, bytes.clone())
                 .fit_to_exact_size(sz)
@@ -574,7 +585,7 @@ fn draw_avatar(
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            "?",
+            "…",
             egui::FontId::proportional(size * 0.45),
             egui::Color32::WHITE,
         );
