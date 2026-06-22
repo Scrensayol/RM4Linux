@@ -150,6 +150,15 @@ pub enum BackendCommand {
     },
 }
 
+impl BackendCommand {
+    /// Commands that write the account store to disk. These are handled inline
+    /// (serially, in receive order) by `backend_loop` rather than spawned, so
+    /// two saves can never interleave into a torn file or land out of order.
+    fn is_serial_persistence(&self) -> bool {
+        matches!(self, BackendCommand::SaveStore { .. })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Events (Backend → UI)
 // ---------------------------------------------------------------------------
@@ -300,7 +309,28 @@ async fn backend_loop(
         let client = client.clone();
         let tx = tx.clone();
 
-        // Each command runs as its own spawned task for concurrency.
+        // Account-store writes MUST run serially and in the order they were
+        // enqueued. Spawning them (as we do for everything else) let two saves
+        // overlap on the same file — interleaving into a torn AES-GCM blob that
+        // no longer decrypts — or finish out of order, so an older store
+        // clobbered a newer one. Both were the v1.4.4 lockout/corruption bug.
+        // Handle them inline so the next command isn't even dequeued until the
+        // write has fully landed. The write itself is fast (encrypt + atomic
+        // rename), so blocking the loop here is fine.
+        if cmd.is_serial_persistence() {
+            match handle_command(cmd, &client, &tx).await {
+                Ok(evt) => {
+                    let _ = tx.send(evt);
+                }
+                Err(e) => {
+                    error!("Backend error: {e}");
+                    let _ = tx.send(BackendEvent::Error(e.to_string()));
+                }
+            }
+            continue;
+        }
+
+        // Every other command runs as its own spawned task for concurrency.
         tokio::spawn(async move {
             match handle_command(cmd, &client, &tx).await {
                 Ok(evt) => {

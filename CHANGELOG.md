@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.4.5
+
+### Fixed
+- **Account corruption and false "wrong password" lockouts.** Two saves could overlap and tear the encrypted account file, which then failed to decrypt and was wrongly blamed on the master password. Saves are now atomic (temp file plus rename) and run one at a time, and a `.bak` copy is kept.
+- **Automatic recovery.** If the account file fails to load, the `.bak` copy is tried and the main file is repaired from it. The error message no longer assumes a wrong password.
+- Config and preset files now use the same atomic write, so a crash mid-save can't truncate them.
+
 ## v1.4.4
 
 ### Added

@@ -5,6 +5,7 @@ pub mod error;
 pub mod models;
 pub mod presets;
 pub mod process;
+pub mod storage;
 
 pub use error::CoreError;
 pub use models::{Account, AccountStore, AppConfig};

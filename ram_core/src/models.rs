@@ -248,10 +248,11 @@ impl AppConfig {
             .unwrap_or_default()
     }
 
-    /// Persist to a JSON file.
+    /// Persist to a JSON file via an atomic write (temp + fsync + rename) so a
+    /// concurrent read or a crash never sees a half-written config.
     pub fn save(&self, path: &std::path::Path) -> Result<(), crate::CoreError> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        crate::storage::atomic_write(path, json.as_bytes())?;
         Ok(())
     }
 }

@@ -109,7 +109,7 @@ pub fn save(
         None => unique_path(&dir, &preset.name),
     };
     let json = serde_json::to_string_pretty(preset)?;
-    std::fs::write(&target, json)?;
+    crate::storage::atomic_write(&target, json.as_bytes())?;
     Ok(target)
 }
 
