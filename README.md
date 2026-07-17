@@ -5,3 +5,5 @@ RM4Linux is a port of the popular Roblox Account Manager to Linux.
 > [!WARNING]
 > **Voltux ONLY!!**
 > This tool is designed specifically for **[Voltux](https://discord.gg/voltux)**. There are currently no plans to add support for Sober anytime soon.
+
+Please report any issues you encounter on this repo!
