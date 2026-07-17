@@ -9,12 +9,22 @@ mod toast;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-/// Canonical data directory: `%APPDATA%\RM`.
+/// Canonical data directory: `%APPDATA%\RM` on Windows, `$HOME/.config/RM` on Linux.
 pub fn data_dir() -> PathBuf {
-    let base = std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("RM")
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        base.join("RM")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let base = std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".config"))
+            .unwrap_or_else(|_| PathBuf::from("."));
+        base.join("RM")
+    }
 }
 
 /// One-time migration: turn each entry of `config.favorite_places` into a
@@ -95,6 +105,19 @@ fn maybe_migrate_legacy_data(data_dir: &std::path::Path) {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    {
+        // Disable hardware acceleration features in WebKitGTK to prevent blank rendering
+        // on Wayland and NVIDIA graphics drivers.
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        // Disable WebProcess sandboxing which fails to initialize under restricted user namespace environments.
+        std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
+        // Force the WebView process to load with an en-US desktop locale for captcha fingerprint consistency.
+        std::env::set_var("LANG", "en_US.UTF-8");
+        std::env::set_var("LANGUAGE", "en_US:en");
+    }
+
     let data_dir = data_dir();
     let _ = std::fs::create_dir_all(&data_dir);
 

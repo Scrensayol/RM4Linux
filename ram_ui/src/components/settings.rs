@@ -26,7 +26,7 @@ pub fn show(
     config: &mut AppConfig,
     has_password: bool,
     settings_state: &mut SettingsState,
-    roblox_running: bool,
+    _roblox_running: bool,
 ) -> Option<SettingsAction> {
     let mut action: Option<SettingsAction> = None;
 
@@ -46,9 +46,14 @@ pub fn show(
         ui.set_min_width(ui.available_width());
         ui.strong("Storage");
         ui.add_space(4.0);
+        let label = if cfg!(target_os = "windows") {
+            "Use Windows Credential Manager (instead of encrypted file)"
+        } else {
+            "Use OS Keychain / Secret Service (instead of encrypted file)"
+        };
         ui.checkbox(
             &mut config.use_credential_manager,
-            "Use Windows Credential Manager (instead of encrypted file)",
+            label,
         );
     });
     ui.add_space(6.0);
@@ -59,48 +64,53 @@ pub fn show(
         ui.strong("Launch Behavior");
         ui.add_space(4.0);
 
-        let mut wants_multi = config.multi_instance_enabled;
-        let toggled = ui.checkbox(
-            &mut wants_multi,
-            "Enable multi-instance",
-        ).changed();
-        if toggled {
-            if wants_multi {
-                action = Some(SettingsAction::EnableMultiInstance);
-            } else {
-                action = Some(SettingsAction::DisableMultiInstance);
+        #[cfg(target_os = "windows")]
+        {
+            let mut wants_multi = config.multi_instance_enabled;
+            let toggled = ui.checkbox(
+                &mut wants_multi,
+                "Enable multi-instance",
+            ).changed();
+            if toggled {
+                if wants_multi {
+                    action = Some(SettingsAction::EnableMultiInstance);
+                } else {
+                    action = Some(SettingsAction::DisableMultiInstance);
+                }
             }
-        }
-        if config.multi_instance_enabled {
-            ui.colored_label(
-                egui::Color32::from_rgb(220, 160, 40),
-                "\u{26a0} This interacts with Hyperion anti-cheat and may carry ban risk.",
-            );
-        }
-        if !config.multi_instance_enabled && roblox_running {
-            ui.colored_label(
-                egui::Color32::from_rgb(180, 180, 180),
-                "Close all Roblox processes (including tray) before enabling.",
-            );
-        }
+            if config.multi_instance_enabled {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 160, 40),
+                    "\u{26a0} This interacts with Hyperion anti-cheat and may carry ban risk.",
+                );
+            }
+            if !config.multi_instance_enabled && _roblox_running {
+                ui.colored_label(
+                    egui::Color32::from_rgb(180, 180, 180),
+                    "Close all Roblox processes (including tray) before enabling.",
+                );
+            }
 
-        ui.add_space(4.0);
-        ui.checkbox(
-            &mut config.kill_background_roblox,
-            "Kill Roblox tray/background processes automatically",
-        ).on_hover_text("Kills idle \"always running\" Roblox processes (--launch-to-tray).");
-        if config.multi_instance_enabled && !config.kill_background_roblox {
-            ui.colored_label(
-                egui::Color32::from_rgb(220, 160, 40),
-                "⚠ Recommended when multi-instance is enabled. Tray processes stack up.",
-            );
-        }
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut config.kill_background_roblox,
+                "Kill Roblox tray/background processes automatically",
+            ).on_hover_text("Kills idle \"always running\" Roblox processes (--launch-to-tray).");
+            if config.multi_instance_enabled && !config.kill_background_roblox {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 160, 40),
+                    "⚠ Recommended when multi-instance is enabled. Tray processes stack up.",
+                );
+            }
 
-        ui.add_space(4.0);
-        ui.checkbox(
-            &mut config.auto_arrange_windows,
-            "Auto-arrange Roblox windows after launch",
-        ).on_hover_text("Tiles Roblox windows in a grid (2 = side-by-side, 4 = 2×2, etc.).");
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut config.auto_arrange_windows,
+                "Auto-arrange Roblox windows after launch",
+            ).on_hover_text("Tiles Roblox windows in a grid (2 = side-by-side, 4 = 2×2, etc.).");
+
+            ui.add_space(4.0);
+        }
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {

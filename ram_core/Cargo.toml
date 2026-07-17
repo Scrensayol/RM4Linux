@@ -20,11 +20,12 @@ aes-gcm = "0.10"
 rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
-keyring = { version = "3", features = ["windows-native"] }
+sysinfo = "0.32"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 
 [target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
@@ -35,4 +36,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
 ] }
-sysinfo = "0.32"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["linux-native"] }

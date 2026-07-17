@@ -215,8 +215,13 @@ fn default_sort_order() -> u32 {
 
 impl Default for AppConfig {
     fn default() -> Self {
+        #[cfg(target_os = "windows")]
         let data_dir = std::env::var("APPDATA")
             .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        #[cfg(not(target_os = "windows"))]
+        let data_dir = std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".config"))
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
         Self {
             accounts_path: data_dir.join("RM").join("accounts.dat"),

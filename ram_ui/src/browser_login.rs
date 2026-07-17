@@ -117,6 +117,15 @@ fn run_child_inner(profile_dir: PathBuf, outfile: PathBuf) -> Result<(), String>
     info!("browser_login child: start, profile={}, out={}", profile_dir.display(), outfile.display());
     std::fs::create_dir_all(&profile_dir)
         .map_err(|e| format!("create profile dir: {e}"))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&profile_dir) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o755);
+            let _ = std::fs::set_permissions(&profile_dir, permissions);
+        }
+    }
 
     let event_loop = EventLoopBuilder::<()>::new().build();
 
@@ -128,9 +137,140 @@ fn run_child_inner(profile_dir: PathBuf, outfile: PathBuf) -> Result<(), String>
 
     let mut web_context = WebContext::new(Some(profile_dir));
 
-    let webview = WebViewBuilder::new_with_web_context(&mut web_context)
+    let webgl_script = r#"(function() {
+        // 1. Mask the WebGL Renderer (Disguise Mesa Linux drivers as standard NVIDIA Windows/Linux specs)
+        try {
+            const orgGetParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(param) {
+                if (param === 37445) return 'NVIDIA Corporation'; // UNMASKED_VENDOR_WEBGL
+                if (param === 37446) return 'NVIDIA GeForce RTX 4060/PCIe/SSE2'; // UNMASKED_RENDERER_WEBGL
+                return orgGetParameter.apply(this, arguments);
+            };
+            if (typeof WebGL2RenderingContext !== 'undefined') {
+                const orgGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
+                WebGL2RenderingContext.prototype.getParameter = function(param) {
+                    if (param === 37445) return 'NVIDIA Corporation'; // UNMASKED_VENDOR_WEBGL
+                    if (param === 37446) return 'NVIDIA GeForce RTX 4060/PCIe/SSE2'; // UNMASKED_RENDERER_WEBGL
+                    return orgGetParameter2.apply(this, arguments);
+                };
+            }
+        } catch(e) {}
+
+        // 2. Hide Automation Flags
+        try {
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        } catch(e) {}
+
+        // 3. Normalize Language Arrays
+        try {
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        } catch(e) {}
+
+        // 4. Fabricate Realistic Screen Boundaries (Prevents Webview Box detection)
+        try {
+            Object.defineProperty(Screen.prototype, 'width', { get: () => 1920 });
+            Object.defineProperty(Screen.prototype, 'height', { get: () => 1080 });
+            Object.defineProperty(Screen.prototype, 'colorDepth', { get: () => 24 });
+            Object.defineProperty(Screen.prototype, 'pixelDepth', { get: () => 24 });
+        } catch(e) {}
+
+        // 5. Fabricate the missing window.chrome object structure
+        try {
+            window.chrome = {
+                app: {
+                    isInstalled: false,
+                    InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                    RunningState: { CAN_RUN: 'can_run', CANNOT_RUN: 'cannot_run', RUNNING: 'running' }
+                },
+                runtime: {
+                    OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                    OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+                    PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                    PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                    PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+                    RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }
+                }
+            };
+        } catch(e) {}
+
+        // 6. Mock a genuine Chrome Plugin ecosystem
+        try {
+            const mockPlugins = [
+                { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+                { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
+                { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }
+            ];
+
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => {
+                    const proto = Object.create(PluginArray.prototype);
+                    mockPlugins.forEach((p, i) => {
+                        const pl = Object.create(Plugin.prototype);
+                        Object.defineProperties(pl, {
+                            name: { get: () => p.name },
+                            filename: { get: () => p.filename },
+                            description: { get: () => p.description }
+                        });
+                        proto[i] = pl;
+                        proto[p.name] = pl;
+                    });
+                    Object.defineProperty(proto, 'length', { get: () => mockPlugins.length });
+                    return proto;
+                }
+            });
+        } catch(e) {}
+
+        // 7. Fake typical Permissions API properties
+        try {
+            const originalQuery = navigator.permissions.query;
+            navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission, onchange: null }) :
+                    originalQuery(parameters)
+            );
+        } catch(e) {}
+    })();"#;
+
+    let builder = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_url(LOGIN_URL)
-        .build(&window)
+        .with_user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+        .with_initialization_script(webgl_script)
+        .with_navigation_handler(|url| {
+            if url.starts_with("roblox-player:") {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(&url)
+                    .spawn();
+                false
+            } else {
+                true
+            }
+        });
+
+    #[cfg(target_os = "linux")]
+    let webview = {
+        use tao::platform::unix::WindowExtUnix;
+        use wry::WebViewBuilderExtUnix;
+        use wry::WebViewExtUnix;
+        use gtk::prelude::*;
+        use webkit2gtk::{WebViewExt, WebContextExt, CookieManagerExt};
+        let vbox = window.default_vbox()
+            .ok_or_else(|| "Failed to get default vbox from window".to_string())?;
+        let wv = builder.build_gtk(vbox)
+            .map_err(|e| format!("webview build: {e}"))?;
+        
+        // Explicitly set cookie policy to Always Allow so session states are preserved
+        if let Some(context) = wv.webview().context() {
+            if let Some(cookie_manager) = context.cookie_manager() {
+                cookie_manager.set_accept_policy(webkit2gtk::CookieAcceptPolicy::Always);
+            }
+        }
+        
+        wv.webview().show();
+        wv
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let webview = builder.build(&window)
         .map_err(|e| format!("webview build: {e}"))?;
 
     info!("browser_login child: entering event loop");
@@ -243,6 +383,15 @@ fn run_browse_as_inner(profile_dir: PathBuf, cookie_in: PathBuf, label: String) 
 
     std::fs::create_dir_all(&profile_dir)
         .map_err(|e| format!("create profile dir: {e}"))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&profile_dir) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o755);
+            let _ = std::fs::set_permissions(&profile_dir, permissions);
+        }
+    }
 
     let event_loop = EventLoopBuilder::<()>::new().build();
 
@@ -277,7 +426,101 @@ fn run_browse_as_inner(profile_dir: PathBuf, cookie_in: PathBuf, label: String) 
     let boot_path_js = serde_json::to_string(BROWSE_AS_BOOT_PATH).unwrap();
     let home_url_js = serde_json::to_string(BROWSE_AS_HOME_URL).unwrap();
     let init_script = format!(
-        r#"(function(){{
+        r#"(function() {{
+            // 1. Mask the WebGL Renderer (Disguise Mesa Linux drivers as standard NVIDIA Windows/Linux specs)
+            try {{
+                const orgGetParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(param) {{
+                    if (param === 37445) return 'NVIDIA Corporation'; // UNMASKED_VENDOR_WEBGL
+                    if (param === 37446) return 'NVIDIA GeForce RTX 4060/PCIe/SSE2'; // UNMASKED_RENDERER_WEBGL
+                    return orgGetParameter.apply(this, arguments);
+                }};
+                if (typeof WebGL2RenderingContext !== 'undefined') {{
+                    const orgGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
+                    WebGL2RenderingContext.prototype.getParameter = function(param) {{
+                        if (param === 37445) return 'NVIDIA Corporation'; // UNMASKED_VENDOR_WEBGL
+                        if (param === 37446) return 'NVIDIA GeForce RTX 4060/PCIe/SSE2'; // UNMASKED_RENDERER_WEBGL
+                        return orgGetParameter2.apply(this, arguments);
+                    }};
+                }}
+            }} catch(e) {{}}
+
+            // 2. Hide Automation Flags
+            try {{
+                Object.defineProperty(navigator, 'webdriver', {{ get: () => false }});
+            }} catch(e) {{}}
+
+            // 3. Normalize Language Arrays
+            try {{
+                Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
+            }} catch(e) {{}}
+
+            // 4. Fabricate Realistic Screen Boundaries (Prevents Webview Box detection)
+            try {{
+                Object.defineProperty(Screen.prototype, 'width', {{ get: () => 1920 }});
+                Object.defineProperty(Screen.prototype, 'height', {{ get: () => 1080 }});
+                Object.defineProperty(Screen.prototype, 'colorDepth', {{ get: () => 24 }});
+                Object.defineProperty(Screen.prototype, 'pixelDepth', {{ get: () => 24 }});
+            }} catch(e) {{}}
+
+            // 5. Fabricate the missing window.chrome object structure
+            try {{
+                window.chrome = {{
+                    app: {{
+                        isInstalled: false,
+                        InstallState: {{ DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }},
+                        RunningState: {{ CAN_RUN: 'can_run', CANNOT_RUN: 'cannot_run', RUNNING: 'running' }}
+                    }},
+                    runtime: {{
+                        OnInstalledReason: {{ CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' }},
+                        OnRestartRequiredReason: {{ APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' }},
+                        PlatformArch: {{ ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }},
+                        PlatformNaclArch: {{ ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }},
+                        PlatformOs: {{ ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' }},
+                        RequestUpdateCheckStatus: {{ NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }}
+                    }}
+                }};
+            }} catch(e) {{}}
+
+            // 6. Mock a genuine Chrome Plugin ecosystem
+            try {{
+                const mockPlugins = [
+                    {{ name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
+                    {{ name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
+                    {{ name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }}
+                ];
+
+                Object.defineProperty(navigator, 'plugins', {{
+                    get: () => {{
+                        const proto = Object.create(PluginArray.prototype);
+                        mockPlugins.forEach((p, i) => {{
+                            const pl = Object.create(Plugin.prototype);
+                            Object.defineProperties(pl, {{
+                                name: {{ get: () => p.name }},
+                                filename: {{ get: () => p.filename }},
+                                description: {{ get: () => p.description }}
+                            }});
+                            proto[i] = pl;
+                            proto[p.name] = pl;
+                        }});
+                        Object.defineProperty(proto, 'length', {{ get: () => mockPlugins.length }});
+                        return proto;
+                    }}
+                }});
+            }} catch(e) {{}}
+
+            // 7. Fake typical Permissions API properties
+            try {{
+                const originalQuery = navigator.permissions.query;
+                navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({{ state: Notification.permission, onchange: null }}) :
+                        originalQuery(parameters)
+                );
+            }} catch(e) {{}}
+        }})();
+
+        (function(){{
             try {{
                 document.cookie = ".ROBLOSECURITY=" + {cookie_js_literal} +
                     "; path=/; domain=.roblox.com; secure; samesite=lax";
@@ -290,10 +533,46 @@ fn run_browse_as_inner(profile_dir: PathBuf, cookie_in: PathBuf, label: String) 
         }})();"#,
     );
 
-    let webview = WebViewBuilder::new_with_web_context(&mut web_context)
+    let builder = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_url(BROWSE_AS_BOOT_URL)
         .with_initialization_script(&init_script)
-        .build(&window)
+        .with_user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+        .with_navigation_handler(|url| {
+            if url.starts_with("roblox-player:") {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(&url)
+                    .spawn();
+                false
+            } else {
+                true
+            }
+        });
+
+    #[cfg(target_os = "linux")]
+    let webview = {
+        use tao::platform::unix::WindowExtUnix;
+        use wry::WebViewBuilderExtUnix;
+        use wry::WebViewExtUnix;
+        use gtk::prelude::*;
+        use webkit2gtk::{WebViewExt, WebContextExt, CookieManagerExt};
+        let vbox = window.default_vbox()
+            .ok_or_else(|| "Failed to get default vbox from window".to_string())?;
+        let wv = builder.build_gtk(vbox)
+            .map_err(|e| format!("webview build: {e}"))?;
+        
+        // Explicitly set cookie policy to Always Allow so session states are preserved
+        if let Some(context) = wv.webview().context() {
+            if let Some(cookie_manager) = context.cookie_manager() {
+                cookie_manager.set_accept_policy(webkit2gtk::CookieAcceptPolicy::Always);
+            }
+        }
+        
+        wv.webview().show();
+        wv
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let webview = builder.build(&window)
         .map_err(|e| format!("webview build: {e}"))?;
 
     info!("browse_as child: entering event loop");

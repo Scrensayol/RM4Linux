@@ -1576,7 +1576,12 @@ impl AppState {
                         .push(Toast::error(format!("Could not create folder: {e}")));
                     return;
                 }
+                #[cfg(target_os = "windows")]
                 let _ = std::process::Command::new("explorer")
+                    .arg(&self.presets_dir)
+                    .spawn();
+                #[cfg(not(target_os = "windows"))]
+                let _ = std::process::Command::new("xdg-open")
                     .arg(&self.presets_dir)
                     .spawn();
             }

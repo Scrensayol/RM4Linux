@@ -26,3 +26,7 @@ rfd = "0.15"
 # on non-Windows targets but this project ships Windows-only).
 wry = "0.55"
 tao = "0.35"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+webkit2gtk = "2.0"

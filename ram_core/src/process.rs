@@ -14,7 +14,9 @@
 //! It is gated behind `AppConfig::multi_instance_enabled` (default: off).
 
 use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+#[cfg(windows)]
+use tracing::warn;
 
 use crate::error::CoreError;
 
@@ -27,6 +29,7 @@ use crate::error::CoreError;
 /// The file lives at `%LOCALAPPDATA%\Roblox\LocalStorage\RobloxCookies.dat`.
 /// We truncate it to an empty file; Roblox will recreate it on the next launch
 /// with only the current session's cookie.
+#[cfg(windows)]
 pub fn clear_roblox_cookies() {
     let Ok(local_app_data) = std::env::var("LOCALAPPDATA") else {
         warn!("LOCALAPPDATA not set — cannot clear RobloxCookies.dat");
@@ -46,6 +49,12 @@ pub fn clear_roblox_cookies() {
         Ok(()) => info!("Cleared RobloxCookies.dat for privacy"),
         Err(e) => warn!("Failed to clear RobloxCookies.dat: {e}"),
     }
+}
+
+/// Clear cookies stub for non-Windows platforms.
+#[cfg(not(windows))]
+pub fn clear_roblox_cookies() {
+    debug!("clear_roblox_cookies is a no-op on Linux");
 }
 
 // ---------------------------------------------------------------------------
@@ -105,10 +114,20 @@ pub fn launch_game(
     Ok(())
 }
 
-/// Shell-execute a URI (delegates to `cmd /C start`).
+/// Shell-execute a URI (delegates to `cmd /C start` on Windows and `xdg-open` on Linux).
+#[cfg(windows)]
 fn open_uri(uri: &str) -> Result<(), CoreError> {
     std::process::Command::new("cmd")
         .args(["/C", "start", "", uri])
+        .spawn()
+        .map_err(|e| CoreError::Process(format!("failed to open URI: {e}")))?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_uri(uri: &str) -> Result<(), CoreError> {
+    std::process::Command::new("xdg-open")
+        .arg(uri)
         .spawn()
         .map_err(|e| CoreError::Process(format!("failed to open URI: {e}")))?;
     Ok(())
@@ -119,6 +138,7 @@ fn open_uri(uri: &str) -> Result<(), CoreError> {
 // ---------------------------------------------------------------------------
 
 /// Attempt to locate the Roblox player executable.
+#[cfg(windows)]
 pub fn find_roblox_player() -> Option<PathBuf> {
     // Standard install location under LocalAppData
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
@@ -137,11 +157,18 @@ pub fn find_roblox_player() -> Option<PathBuf> {
     None
 }
 
+/// Roblox player executable locator stub for Linux.
+#[cfg(not(windows))]
+pub fn find_roblox_player() -> Option<PathBuf> {
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Process tracking
 // ---------------------------------------------------------------------------
 
 /// Check if any `RobloxPlayerBeta.exe` is currently running.
+#[cfg(windows)]
 pub fn is_roblox_running() -> bool {
     use sysinfo::System;
     let mut sys = System::new();
@@ -151,7 +178,13 @@ pub fn is_roblox_running() -> bool {
         .any(|p| p.name().to_string_lossy() == "RobloxPlayerBeta.exe")
 }
 
+#[cfg(not(windows))]
+pub fn is_roblox_running() -> bool {
+    roblox_instance_count() > 0
+}
+
 /// Count how many Roblox player instances are running.
+#[cfg(windows)]
 pub fn roblox_instance_count() -> usize {
     use sysinfo::System;
     let mut sys = System::new();
@@ -162,7 +195,40 @@ pub fn roblox_instance_count() -> usize {
         .count()
 }
 
+#[cfg(not(windows))]
+pub fn roblox_instance_count() -> usize {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let cmdline_path = path.join("cmdline");
+        let Ok(cmdline_bytes) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let cmdline_str = String::from_utf8_lossy(&cmdline_bytes);
+        if cmdline_str.contains("RobloxPlayerBeta.exe") {
+            let exe_path = path.join("exe");
+            if let Ok(exe_link) = std::fs::read_link(&exe_path) {
+                let exe_str = exe_link.to_string_lossy();
+                if exe_str.contains("wine") || exe_str.contains("Roblox") {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
 /// Kill all running Roblox player instances.
+#[cfg(windows)]
 pub fn kill_all_roblox() -> Result<usize, CoreError> {
     use sysinfo::System;
     let mut sys = System::new();
@@ -183,9 +249,46 @@ pub fn kill_all_roblox() -> Result<usize, CoreError> {
     Ok(count)
 }
 
+#[cfg(not(windows))]
+pub fn kill_all_roblox() -> Result<usize, CoreError> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let cmdline_path = path.join("cmdline");
+        let Ok(cmdline_bytes) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let cmdline_str = String::from_utf8_lossy(&cmdline_bytes);
+        if cmdline_str.contains("RobloxPlayerBeta.exe") {
+            let exe_path = path.join("exe");
+            if let Ok(exe_link) = std::fs::read_link(&exe_path) {
+                let exe_str = exe_link.to_string_lossy();
+                if exe_str.contains("wine") || exe_str.contains("Roblox") {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", name])
+                        .status();
+                    count += 1;
+                }
+            }
+        }
+    }
+    info!("Killed {count} Roblox instance(s)");
+    Ok(count)
+}
+
 /// Kill Roblox processes that were launched with `--launch-to-tray` (background
 /// "always running" instances). These stack up with multi-instance and aren't
 /// associated with an actual game session.
+#[cfg(windows)]
 pub fn kill_tray_roblox() -> usize {
     use sysinfo::System;
     let mut sys = System::new();
@@ -259,6 +362,44 @@ pub fn kill_tray_roblox() -> usize {
         info!("Killed {killed} tray Roblox process(es)");
     }
     killed
+}
+
+#[cfg(not(windows))]
+pub fn kill_tray_roblox() -> usize {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let cmdline_path = path.join("cmdline");
+        let Ok(cmdline_bytes) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let cmdline_str = String::from_utf8_lossy(&cmdline_bytes);
+        if cmdline_str.contains("RobloxPlayerBeta.exe") && cmdline_str.contains("--launch-to-tray") {
+            let exe_path = path.join("exe");
+            if let Ok(exe_link) = std::fs::read_link(&exe_path) {
+                let exe_str = exe_link.to_string_lossy();
+                if exe_str.contains("wine") || exe_str.contains("Roblox") {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", name])
+                        .status();
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count > 0 {
+        info!("Killed {count} tray Roblox process(es)");
+    }
+    count
 }
 
 /// Read a process's command line directly from its PEB via the Win32 API.
@@ -482,9 +623,8 @@ pub fn enable_multi_instance() -> Result<(), CoreError> {
 
 #[cfg(not(windows))]
 pub fn enable_multi_instance() -> Result<(), CoreError> {
-    Err(CoreError::Process(
-        "multi-instance is only supported on Windows".into(),
-    ))
+    info!("multi-instance is managed natively by Volt/Voltux on Linux");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -651,3 +791,4 @@ pub fn arrange_roblox_windows() {
 pub fn arrange_roblox_windows() {
     info!("Window arrangement is only supported on Windows");
 }
+
