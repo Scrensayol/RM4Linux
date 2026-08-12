@@ -11,32 +11,24 @@ stages:
 variables:
   CARGO_TERM_COLOR: always
 
-# Lint and test every push to main. Tag pipelines skip this and go straight
-# to build, since the tagged commit already passed on its way through main.
+.rust_linux_template:
+  image: rust:latest
+  before_script:
+    - apt-get update -yqq
+    - apt-get install -yqq pkg-config libssl-dev libgtk-3-dev libx11-dev libxcb1-dev libxext-dev libxrender-dev libxi-dev libxrandr-dev libxcursor-dev libgl1-mesa-dev build-essential curl
+
 check:
+  extends: .rust_linux_template
   stage: check
-  tags:
-    - windows
-    - self-hosted
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
-  # No cache stanza on purpose. This is a shell runner, so its build
-  # directory (and target/ inside it) already persists between jobs, and
-  # GitLab's cache would zip and unzip several GB of artifacts to
-  # reproduce something we already have on disk.
   script:
-    # Same PATH fixup as the build job, see the comment there.
-    - $env:PATH = "C:\Users\Keeper\.cargo\bin;" + $env:PATH
-    - rustup default stable
-    # clippy implies check, so there's no separate cargo check step.
     - cargo clippy --workspace --all-targets -- -D warnings
     - cargo test --workspace
 
 build:
+  extends: .rust_linux_template
   stage: build
-  image: ubuntu:latest
-  tags:
-    - linux
   rules:
     - if: $CI_COMMIT_TAG =~ /^v/
   cache:
@@ -45,7 +37,6 @@ build:
       - target/
       - .cargo/
   script:
-    - apt-get update -yqq && apt-get install -yqq libwebkit2gtk-4.1-dev libgtk-3-dev pkg-config libssl-dev build-essential curl
     - cargo test --release
     - cargo build --release
     - |
