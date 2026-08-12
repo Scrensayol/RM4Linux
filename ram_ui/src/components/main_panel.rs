@@ -3,6 +3,8 @@
 use eframe::egui;
 use ram_core::models::{Account, LaunchPreset};
 
+use crate::theme::ThemeUi;
+
 /// Actions the main panel can request.
 pub enum MainPanelAction {
     LaunchGame { place_id: u64, job_id: Option<String> },
@@ -42,12 +44,6 @@ pub struct MainPanelResult {
     pub launch_btn_rect: egui::Rect,
 }
 
-// Visual tokens — accent and Launch-button colors. Kept local to this file so
-// the rest of the UI can stay on egui defaults.
-const ACCENT_LAUNCH: egui::Color32 = egui::Color32::from_rgb(60, 130, 220);
-const ACCENT_LAUNCH_HOVER: egui::Color32 = egui::Color32::from_rgb(80, 150, 240);
-const ACCENT_BROWSE: egui::Color32 = egui::Color32::from_rgb(70, 70, 90);
-
 /// Draw the main panel for a selected account.
 pub fn show(
     ui: &mut egui::Ui,
@@ -58,6 +54,7 @@ pub fn show(
     presets: &[LaunchPreset],
     anonymize: bool,
 ) -> MainPanelResult {
+    let theme = ui.theme();
     let mut action: Option<MainPanelAction> = None;
     let mut launch_btn_rect = egui::Rect::NOTHING;
 
@@ -105,7 +102,7 @@ pub fn show(
                                 if ui
                                     .button(
                                         egui::RichText::new("\u{1f5d1}  Remove account")
-                                            .color(egui::Color32::from_rgb(220, 80, 80)),
+                                            .color(theme.danger_text),
                                     )
                                     .clicked()
                                 {
@@ -131,14 +128,14 @@ pub fn show(
             {
                 let banned = info.is_banned;
                 let bg = if banned {
-                    egui::Color32::from_rgb(80, 30, 30)
+                    theme.danger_surface
                 } else {
-                    egui::Color32::from_rgb(70, 50, 20)
+                    theme.warning_surface
                 };
                 let fg = if banned {
-                    egui::Color32::from_rgb(255, 110, 110)
+                    theme.danger_text
                 } else {
-                    egui::Color32::from_rgb(240, 180, 80)
+                    theme.warning_text
                 };
                 egui::Frame::default()
                     .fill(bg)
@@ -223,33 +220,15 @@ pub fn show(
 
                 // Preset quick-select chips
                 if !presets.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            egui::RichText::new("Presets")
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                        for (i, preset) in presets.iter().enumerate() {
-                            // push_id disambiguates buttons that share a
-                            // label — without it egui hashes by label alone
-                            // and clicks on later chips register against
-                            // the first matching one.
-                            ui.push_id(i, |ui| {
-                                let btn = ui.small_button(&preset.name).on_hover_text(
-                                    match &preset.job_id {
-                                        Some(j) if !j.is_empty() => {
-                                            format!("Place {}, Job {}", preset.place_id, j)
-                                        }
-                                        _ => format!("Place {}", preset.place_id),
-                                    },
-                                );
-                                if btn.clicked() {
-                                    state.place_id_input = preset.place_id.to_string();
-                                    state.job_id_input =
-                                        preset.job_id.clone().unwrap_or_default();
-                                }
-                            });
-                        }
-                    });
+                    let label = egui::RichText::new("Presets")
+                        .color(ui.visuals().weak_text_color());
+                    super::preset_chips(
+                        ui,
+                        label,
+                        presets,
+                        &mut state.place_id_input,
+                        &mut state.job_id_input,
+                    );
                     ui.add_space(8.0);
                 }
 
@@ -284,11 +263,11 @@ pub fn show(
                             egui::RichText::new("\u{1f680}  Launch")
                                 .size(15.0)
                                 .strong()
-                                .color(egui::Color32::WHITE),
+                                .color(theme.on_accent),
                         )
                         .min_size(egui::vec2(primary_w, primary_h))
                         .fill(if place_valid {
-                            ACCENT_LAUNCH
+                            theme.accent
                         } else {
                             ui.visuals().widgets.inactive.bg_fill
                         }),
@@ -311,7 +290,7 @@ pub fn show(
                         ui.painter().rect_filled(
                             launch_btn.rect,
                             egui::Rounding::same(3.0),
-                            ACCENT_LAUNCH_HOVER.linear_multiply(0.15),
+                            theme.accent_hover.linear_multiply(0.15),
                         );
                     }
 
@@ -323,7 +302,7 @@ pub fn show(
                                     .color(ui.visuals().strong_text_color()),
                             )
                             .min_size(egui::vec2(primary_w, primary_h))
-                            .fill(ACCENT_BROWSE),
+                            .fill(theme.surface_raised),
                         )
                         .on_hover_text("Open a webview signed in as this account")
                         .clicked()
@@ -474,7 +453,7 @@ pub fn show(
                             );
                             let age = chrono::Utc::now() - *ts;
                             let color = if age.num_hours() > 24 {
-                                egui::Color32::from_rgb(200, 160, 60)
+                                theme.warning
                             } else {
                                 ui.visuals().text_color()
                             };
@@ -506,12 +485,12 @@ pub fn show(
                 if account.cookie_expired && !mod_active {
                     ui.add_space(6.0);
                     egui::Frame::default()
-                        .fill(egui::Color32::from_rgb(80, 30, 30))
+                        .fill(theme.danger_surface)
                         .rounding(egui::Rounding::same(4.0))
                         .inner_margin(8.0)
                         .show(ui, |ui| {
                             ui.colored_label(
-                                egui::Color32::from_rgb(255, 100, 100),
+                                theme.danger_text,
                                 "\u{26a0} Cookie expired. Remove and re-add this account with a fresh cookie.",
                             );
                         });
@@ -580,25 +559,26 @@ fn draw_avatar(
         ui.painter().rect_filled(
             rect,
             size / 8.0,
-            egui::Color32::from_rgb(60, 60, 70),
+            ui.theme().surface,
         );
         ui.painter().text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             "…",
             egui::FontId::proportional(size * 0.45),
-            egui::Color32::WHITE,
+            ui.theme().on_accent,
         );
     }
 }
 
 /// Pill-shaped presence chip ("Online" / "In game …" / "Offline" + colored dot).
 fn draw_presence_chip(ui: &mut egui::Ui, presence: &ram_core::models::Presence) {
-    let (color, label) = match presence.user_presence_type {
-        1 => (egui::Color32::from_rgb(60, 180, 75), "Online"),
-        2 => (egui::Color32::from_rgb(30, 144, 255), "In game"),
-        3 => (egui::Color32::from_rgb(255, 165, 0), "In Studio"),
-        _ => (egui::Color32::from_rgb(130, 130, 130), "Offline"),
+    let color = ui.theme().presence(presence.user_presence_type);
+    let label = match presence.user_presence_type {
+        1 => "Online",
+        2 => "In game",
+        3 => "In Studio",
+        _ => "Offline",
     };
     let detail = presence.status_text();
     let text: String = if presence.user_presence_type == 0 || detail == label {

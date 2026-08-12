@@ -6,12 +6,15 @@
 //!   - Groups are collapsible, colored containers that visually encapsulate their accounts.
 
 use eframe::egui;
+use ram_core::instances::TrackedInstance;
 use ram_core::models::{Account, GroupMeta};
+
+use crate::theme::{Theme, ThemeUi};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 /// Stable 5-character anonymized tag derived from a user ID.
-fn anon_tag(user_id: u64) -> String {
+pub fn anon_tag(user_id: u64) -> String {
     let mut h = std::hash::DefaultHasher::new();
     user_id.hash(&mut h);
     let hash = h.finish();
@@ -150,6 +153,14 @@ pub enum SidebarAction {
     },
     /// User confirmed changing from custom sort → lose custom order.
     ResetCustomOrder,
+    /// Bring this account's Roblox client to the front.
+    FocusInstance(u32),
+    /// Close this account's Roblox client. Only ever emitted for an attribution
+    /// RM confirmed by reading the client's command line; `ram_core` re-checks
+    /// that immediately before terminating anyway.
+    KillInstance(u32),
+    /// Launch `user_id` into whatever server `target_user_id` is currently in.
+    JoinAccountServer { user_id: u64, target_user_id: u64 },
 }
 
 /// Sidebar result: actions to process and the list of currently visible user IDs.
@@ -163,6 +174,7 @@ pub struct SidebarResult {
 }
 
 /// Draw the sidebar. Returns actions + visible account IDs.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut egui::Ui,
     state: &mut SidebarState,
@@ -171,6 +183,9 @@ pub fn show(
     anonymize: bool,
     groups: &HashMap<String, GroupMeta>,
     avatar_bytes: &HashMap<u64, Vec<u8>>,
+    // Running clients RM has matched to an account, so a row can offer to
+    // focus or close its own.
+    instances: &[TrackedInstance],
 ) -> SidebarResult {
     let mut actions: Vec<SidebarAction> = Vec::new();
     let mut add_btn_rect = egui::Rect::NOTHING;
@@ -232,7 +247,7 @@ pub fn show(
         // Selection count badge
         if selected_ids.len() > 1 {
             ui.colored_label(
-                egui::Color32::from_rgb(130, 180, 255),
+                ui.theme().accent_text,
                 format!("{} selected", selected_ids.len()),
             );
         }
@@ -409,7 +424,7 @@ pub fn show(
                                         ui.painter().hline(
                                             rect.x_range(),
                                             line_y,
-                                            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 80)),
+                                            egui::Stroke::new(2.0, ui.theme().drop_reorder),
                                         );
                                     }
                                     _ => {}
@@ -458,7 +473,7 @@ pub fn show(
                                 egui::Align2::RIGHT_TOP,
                                 format!("{}", members.len()),
                                 egui::FontId::proportional(11.0),
-                                egui::Color32::GRAY,
+                                ui.theme().text_muted,
                             );
 
                             // Click header to toggle collapse
@@ -504,6 +519,7 @@ pub fn show(
                                         groups,
                                         is_custom,
                                         avatar_bytes,
+                                        instances,
                                     );
                                     flat_idx += 1;
                                 }
@@ -530,6 +546,7 @@ pub fn show(
                         groups,
                         is_custom,
                         avatar_bytes,
+                        instances,
                     );
                     flat_idx += 1;
                 }
@@ -547,21 +564,22 @@ pub fn show(
                     }
                     DragPayload::Group { name } => format!("\u{1f4c1} {}", name),
                 };
+                let theme = ui.theme();
                 let galley = painter.layout_no_wrap(
                     text,
                     egui::FontId::proportional(12.0),
-                    egui::Color32::WHITE,
+                    theme.on_accent,
                 );
                 let text_size = galley.size();
                 let label_rect = egui::Rect::from_min_size(
                     egui::pos2(pos.x + 12.0, pos.y - 8.0),
                     text_size + egui::vec2(10.0, 6.0),
                 );
-                painter.rect_filled(label_rect, 4.0, egui::Color32::from_rgb(60, 60, 60));
+                painter.rect_filled(label_rect, 4.0, theme.overlay);
                 painter.galley(
                     label_rect.min + egui::vec2(5.0, 3.0),
                     galley,
-                    egui::Color32::WHITE,
+                    theme.on_accent,
                 );
             }
         }
@@ -608,7 +626,9 @@ fn render_account_row(
     _groups: &HashMap<String, GroupMeta>,
     is_custom: bool,
     avatar_bytes: &HashMap<u64, Vec<u8>>,
+    instances: &[TrackedInstance],
 ) {
+    let theme = ui.theme();
     let is_selected = selected_ids.contains(&account.user_id);
     let has_subtitle =
         !anonymize && account.alias.is_empty() && account.display_name != account.username;
@@ -652,27 +672,28 @@ fn render_account_row(
 
                 if is_custom && same_group {
                     // Same group or both ungrouped in custom mode → show reorder hint
-                    ui.painter().rect_filled(rect, 2.0,
-                        egui::Color32::from_rgba_premultiplied(255, 200, 80, 40));
+                    ui.painter()
+                        .rect_filled(rect, 2.0, Theme::wash(theme.drop_reorder, 40));
                     // Draw an insertion line at the top or bottom of the row
                     let line_y = if pointer_in_bottom_half { rect.max.y } else { rect.min.y };
                     ui.painter().hline(
                         rect.x_range(),
                         line_y,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 80)),
+                        egui::Stroke::new(2.0, theme.drop_reorder),
                     );
                 } else {
-                    // Different groups / assign-to-group drop
+                    // Different groups / assign-to-group drop. Green reads as
+                    // "this creates a group", blue as "this moves into one".
                     let highlight_color = if is_ungrouped {
-                        egui::Color32::from_rgba_premultiplied(100, 200, 100, 50)
+                        Theme::wash(theme.success_text, 50)
                     } else {
-                        egui::Color32::from_rgba_premultiplied(100, 150, 255, 50)
+                        Theme::wash(theme.accent_text, 50)
                     };
                     ui.painter().rect_filled(rect, 2.0, highlight_color);
                     ui.painter().rect_stroke(
                         rect,
                         2.0,
-                        egui::Stroke::new(1.5, egui::Color32::from_rgb(130, 200, 130)),
+                        egui::Stroke::new(1.5, theme.success_text),
                     );
                 }
             }
@@ -743,14 +764,14 @@ fn render_account_row(
         ui.painter().rect_filled(
             avatar_rect,
             avatar_size / 2.0,
-            egui::Color32::from_rgb(60, 60, 70),
+            theme.surface,
         );
         ui.painter().text(
             avatar_rect.center(),
             egui::Align2::CENTER_CENTER,
             "…",
             egui::FontId::proportional(avatar_size * 0.45),
-            egui::Color32::from_rgb(160, 160, 170),
+            theme.text_faint,
         );
     }
 
@@ -761,11 +782,11 @@ fn render_account_row(
     //   3. otherwise → green/blue/orange/gray presence dot
     let moderated = account.moderation.as_ref().is_some_and(|m| m.is_active());
     let (dot_color, dot_glyph) = if moderated {
-        (egui::Color32::from_rgb(230, 130, 40), Some("!"))
+        (theme.moderated, Some("!"))
     } else if account.cookie_expired {
-        (egui::Color32::from_rgb(200, 60, 60), Some("x"))
+        (theme.danger, Some("x"))
     } else {
-        (presence_color(account.last_presence.user_presence_type), None)
+        (theme.presence(account.last_presence.user_presence_type), None)
     };
     let dot_center =
         egui::pos2(avatar_rect.max.x - 5.0, avatar_rect.max.y - 5.0);
@@ -782,7 +803,7 @@ fn render_account_row(
             egui::Align2::CENTER_CENTER,
             glyph,
             egui::FontId::proportional(8.0),
-            egui::Color32::WHITE,
+            theme.on_accent,
         );
     }
 
@@ -845,6 +866,79 @@ fn render_account_row(
             ui.close_menu();
         }
         ui.separator();
+
+        // ---- This account's running clients ----
+        let mine: Vec<&TrackedInstance> = instances
+            .iter()
+            .filter(|i| i.user_id == account.user_id)
+            .collect();
+        if !mine.is_empty() {
+            // The PID is only worth showing when there is more than one client
+            // to tell apart. With a single one it is noise.
+            let show_pid = mine.len() > 1;
+            for instance in &mine {
+                let suffix = if show_pid {
+                    format!(" (PID {})", instance.pid)
+                } else {
+                    String::new()
+                };
+                if ui.button(format!("\u{1f5b5}  Focus client{suffix}")).clicked() {
+                    actions.push(SidebarAction::FocusInstance(instance.pid));
+                    ui.close_menu();
+                }
+                // Killing is gated on RM having actually read this client's
+                // command line. A mapping that fell back to appearance order
+                // cannot be re-verified at kill time, so the button is shown
+                // disabled with the reason rather than offered and then
+                // refused, or worse, honoured on a guess.
+                let can_kill = instance.attribution.is_exact();
+                let kill = ui.add_enabled(
+                    can_kill,
+                    egui::Button::new(format!("\u{2716}  Close client{suffix}")),
+                );
+                if !can_kill {
+                    kill.on_disabled_hover_text(
+                        "RM could not read this client's command line, so it cannot \
+                         confirm the client belongs to this account. Use Kill All.",
+                    );
+                } else if kill.clicked() {
+                    actions.push(SidebarAction::KillInstance(instance.pid));
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+        }
+
+        // ---- Join another managed account's server ----
+        let joinable: Vec<&Account> = flat_list
+            .iter()
+            .map(|(_, a)| *a)
+            .filter(|a| {
+                a.user_id != account.user_id
+                    && a.last_presence.user_presence_type == 2
+                    && a.last_presence.place_id.is_some()
+                    && a.last_presence.game_id.is_some()
+            })
+            .collect();
+        if !joinable.is_empty() {
+            ui.menu_button("\u{1f517}  Join server of", |ui| {
+                for other in &joinable {
+                    let name = if anonymize {
+                        format!("Account #{}", anon_tag(other.user_id))
+                    } else {
+                        other.label().to_string()
+                    };
+                    if ui.button(name).clicked() {
+                        actions.push(SidebarAction::JoinAccountServer {
+                            user_id: account.user_id,
+                            target_user_id: other.user_id,
+                        });
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.separator();
+        }
 
         // Game session info
         if let Some(ref gid) = account.last_presence.game_id {
@@ -960,7 +1054,7 @@ fn show_group_editor(
                             ui.painter().rect_stroke(
                                 rect,
                                 4.0,
-                                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                                egui::Stroke::new(2.0, ui.theme().on_accent),
                             );
                         }
                         if resp.clicked() {
@@ -1052,11 +1146,4 @@ fn show_sort_warning(
 
 // ---------------------------------------------------------------------------
 
-fn presence_color(presence_type: u8) -> egui::Color32 {
-    match presence_type {
-        1 => egui::Color32::from_rgb(60, 180, 75),  // Online — green
-        2 => egui::Color32::from_rgb(30, 144, 255),  // In Game — blue
-        3 => egui::Color32::from_rgb(255, 165, 0),   // In Studio — orange
-        _ => egui::Color32::from_rgb(130, 130, 130), // Offline — gray
-    }
-}
+

@@ -1,5 +1,90 @@
 # Changelog
 
+## v1.9.0
+
+### Added
+- **Right-click an account to kill or focus its client.** Killing used to be all or nothing. RM re-checks the process is really that account's client before it terminates anything.
+- **Join the server another account is in.** Right-click an account, pick one that is currently in a game, and it launches straight into that server.
+- **Optional window naming.** Roblox windows can be named after their account so tiled clients are tellable apart. Off by default, in Settings. Unticking it puts the original titles back.
+
+### Changed
+- **Running clients are now matched to their account exactly.** RM reads a token off the client's own command line instead of guessing from the order windows appear in. Bulk launches no longer mix accounts up, and a Roblox you started yourself is no longer mistaken for one of RM's. Where the command line cannot be read, the old guess is still used and is labelled as one.
+- Joining a specific server now uses the same request form the Roblox client itself sends.
+
+### Fixed
+- **Old log files are deleted on first launch.** Logs written before v1.8.1 could contain a Roblox authentication ticket. The current logs never do.
+
+## v1.8.1
+
+### Fixed
+- **Your authentication ticket was being written to the log file.** Launching a game recorded the full launch URI at debug level, and that URI carries a live Roblox auth ticket. Logs are now scrubbed of cookies, auth tickets, CSRF tokens, and your Windows username.
+- **Log files grew without limit.** `rm.log` is now a dated daily file and only the last 7 are kept.
+- **Lower idle CPU.** The running instance counter walked the full process list on every frame.
+
+### Added
+- **Running Roblox clients are matched to the account that launched them.** Hover the instance counter to see which window belongs to which account. This is a best guess, so starting Roblox by hand or bulk launching quickly can attribute a window to the wrong account.
+
+### Changed
+- Color consistency fixes throughout the UI, where the same state was drawn in slightly different shades in different places.
+
+## v1.8.0
+
+### Added
+- **No more master password.** New installs encrypt the account store with a key held in Windows Credential Manager, so RM opens straight to your accounts. The file on disk is still AES-256-GCM and is useless on its own.
+- Existing password users are asked once, after unlocking, whether to switch. Declining is remembered.
+- **Set a master password** is now a deliberate choice in Settings, along with **Stop asking for a password**. Both take effect immediately.
+
+### Fixed
+- **Changing your password could strand accounts.** Every cookie was re-encrypted one at a time and failures were skipped silently, leaving those accounts readable only with the old password. Re-keying now rewrites 32 bytes of header and touches no cookie at all.
+- **Clearing the password did nothing on disk.** It only forgot the password in memory, left the file encrypted with it, and silently stopped saving.
+- **Credential Manager mode never saved your account list.** Saving was gated on having a master password, which that mode never sets.
+- **The old password still worked after changing it.** The backup copy was left encrypted under the retired password, and opening it rolled the store back.
+- Master passwords now use Argon2id with a per-file salt, replacing unsalted SHA-256. The old format is read and upgraded automatically on first unlock.
+- Cookies no longer run 100k hash rounds each time one is decrypted.
+
+## v1.7.0
+
+### Fixed
+- **Preset chips did not wrap.** Past a certain number of presets, the last chip was squeezed into a one-letter-wide column at the edge of the panel instead of moving to the next row. Affected the launch panel and bulk launch.
+- Preset names longer than 24 characters are shortened on the chip, with the full name on hover.
+
+## v1.6.0
+
+### Fixed
+- **Granting universe access failed with "Invalid SubjectType is invalid".** The request nested the subject inside each asset entry. The endpoint takes one subject at the top level and a list of assets, and now gets it.
+- **Partial grant failures were reported as successes.** A 200 from the grant endpoint can still refuse individual assets. Only what Roblox confirms is counted and recorded now, and refusals are named in the log.
+- **"Nothing to grant" when granting access to assets picked from the inventory.** The library and the inventory share one selection but identify rows differently, and the grant only understood the library's. Inventory selections now work, signed by the account whose inventory is open.
+- **Uploads no longer claim an asset passed moderation before it has.** A finished upload operation means Roblox ingested the file, not that the asset is usable. Rows now sit in a new **In review** state and only turn green once `develop.roblox.com` reports the review finished. Auto-grant waits for that too.
+- **Bulk audio uploads failing in a block.** Audio now uploads one at a time with a gap between files, instead of three at once into Roblox's audio rate limit.
+- **Uploads timing out on large files.** The 30 second request timeout covered the file transfer as well. Uploads get 5 minutes; everything else is unchanged.
+- **Retryable failures are retried.** A rate limit or a transient 403 re-sends up to four times with a growing backoff. Only failures raised before the upload reached Roblox retry automatically, so nothing is uploaded twice.
+- **Every failed row now has a Retry button.** It used to be hidden on failures the app judged permanent, which left a wrong guess with no way back.
+- 429 backoff honours Roblox's `Retry-After`, and is jittered so concurrent uploads stop waking up together and colliding again.
+
+## v1.5.0
+
+### Added
+- **Asset Manager tab**, behind a new **Developer options** toggle in Settings (off by default). Upload decals, audio, models, animations and video to Roblox from any saved account.
+- **Bulk import.** Pick many files at once, or drop them anywhere on the window. Each row gets its own creator and asset type, and unsupported or oversized files are flagged in place rather than dropped.
+- **Moderation tracking that survives restarts.** Operation IDs are saved to disk, so closing the app mid-upload does not lose the result. Uploads left in flight by a crash go back to the queue instead of being re-sent blind.
+- **Bulk permission grants.** Select assets and give an experience permission to use them, picked from a dropdown of your experiences or by pasting a place or universe ID.
+- **Auto-grant.** Set "Grant access to" on an import batch and each asset is granted as it clears moderation.
+- **Library and inventory browsing.** A left tree with your uploads plus your own and your groups' inventories, and a sortable, searchable table.
+
+### Changed
+- The HTTP client can now send a pre-encoded body, so uploads reuse the existing CSRF rotation and rate-limit backoff instead of bypassing it.
+
+## v1.4.6
+
+### Fixed
+- **Spammy "403 Forbidden after CSRF retry" notification.** A rate-limited request used up the retry meant for a rotated CSRF token. The two are now counted separately.
+- **CSRF tokens are cached per account** instead of in one shared slot. Roblox ties a token to the session that asked for it, so every account switch ate a guaranteed 403.
+- **Clearer error text.** A 403 with no CSRF challenge is a rejected cookie, not a CSRF failure, and now says so.
+- **Thumbnails and presence stuck for every account** when a single cookie went bad. Thumbnails no longer send a cookie, and a failed avatar fetch no longer aborts the presence refresh.
+- **Wrong avatars and game icons.** Roblox returns thumbnail results out of order and drops IDs it cannot resolve. Results are matched by ID now, not by position.
+- **Background refresh timers** use wall-clock intervals instead of a frame counter, which drifted badly while the window sat idle.
+- **Repeat error notifications** are suppressed for a minute, and the toast stack is capped at five.
+
 ## v1.4.5
 
 ### Fixed

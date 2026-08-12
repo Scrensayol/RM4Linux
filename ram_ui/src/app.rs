@@ -5,12 +5,31 @@ use eframe::egui;
 use ram_core::models::{AccountStore, AppConfig, PrivateServer};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use crate::bridge::{BackendBridge, BackendCommand, BackendEvent};
+use ram_core::assets::{AssetKind, AssetState, ModerationStatus, OperationOutcome};
+
+use crate::bridge::{BackendBridge, BackendCommand, BackendEvent, UploadJob};
 use crate::components::{
-    group_panel, main_panel, presets_panel, private_servers, settings, sidebar, tutorial,
+    asset_manager, group_panel, main_panel, presets_panel, private_servers, settings, sidebar,
+    tutorial,
 };
+use crate::theme::ThemeUi;
 use crate::toast::{Toast, Toasts};
+
+/// Wall-clock interval gate for background work. Returns `true` and stamps
+/// `slot` when `every` has elapsed since the last fire. Callers must put any
+/// cheap guard (empty account list, etc.) *before* this in the condition, since
+/// a `true` result consumes the interval.
+fn interval_due(slot: &mut Option<Instant>, every: Duration) -> bool {
+    let now = Instant::now();
+    if slot.is_none_or(|t| now.duration_since(t) >= every) {
+        *slot = Some(now);
+        true
+    } else {
+        false
+    }
+}
 
 /// Produce a blurred PNG of an avatar for anonymize mode. Returns `None` if
 /// the input couldn't be decoded or re-encoded. Box blur (`fast_blur`) is
@@ -28,6 +47,96 @@ fn anonymize_avatar(bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// How an account is named in anything RM shows or sets on screen.
+///
+/// One function so the instance tooltip and the Roblox window title cannot
+/// drift apart on the thing that matters: with `anonymize_names` on, neither
+/// may contain the username or the alias.
+fn account_display_label(
+    accounts: &[ram_core::models::Account],
+    user_id: u64,
+    anonymize_names: bool,
+) -> String {
+    accounts
+        .iter()
+        .find(|a| a.user_id == user_id)
+        .map(|a| {
+            if anonymize_names {
+                format!("Account #{}", sidebar::anon_tag(a.user_id))
+            } else {
+                a.label().to_string()
+            }
+        })
+        .unwrap_or_else(|| format!("user {user_id}"))
+}
+
+/// What each attributed client's window should be called.
+///
+/// Pure, and split out from [`AppState::retitle_roblox_windows`] for one
+/// reason: a window title is world-readable. Any process on the machine can ask
+/// for it, and it shows up in screenshots, screen shares, and stream captures.
+/// A user who turned on `anonymize_names` asked for their usernames not to be
+/// on screen, and a title bar is very much on screen, so the rule that
+/// `anonymize_names` blanks the name is worth being able to assert directly.
+///
+/// Inferred attributions are titled too. Getting it wrong writes a wrong name
+/// on a title bar, which is cosmetic, so the bar is lower than it is for kill.
+fn instance_window_titles(
+    tracked: &[ram_core::instances::TrackedInstance],
+    accounts: &[ram_core::models::Account],
+    anonymize_names: bool,
+) -> Vec<(u32, String)> {
+    tracked
+        .iter()
+        .map(|instance| {
+            (
+                instance.pid,
+                account_display_label(accounts, instance.user_id, anonymize_names),
+            )
+        })
+        .collect()
+}
+
+/// The body of [`AppState::instance_attribution_summary`], as a free function
+/// over exactly the four things it reads. Split out from the method so it can
+/// be exercised without standing up an `AppState`, which owns a live backend
+/// bridge and a tokio runtime.
+fn attribution_summary(
+    tracked: &[ram_core::instances::TrackedInstance],
+    accounts: &[ram_core::models::Account],
+    anonymize_names: bool,
+    roblox_instance_count: usize,
+) -> String {
+    use ram_core::instances::Attribution;
+
+    if tracked.is_empty() {
+        return "None of these were launched by RM, or they have not been \
+                matched to an account yet."
+            .to_string();
+    }
+
+    let mut lines = vec!["Launched by RM:".to_string()];
+    for instance in tracked {
+        let who = account_display_label(accounts, instance.user_id, anonymize_names);
+        // Only the guesses are marked. An unmarked line was read off the
+        // client's own command line and is not a guess, so hedging it would
+        // make the two indistinguishable again.
+        let suffix = match instance.attribution {
+            Attribution::Exact => "",
+            Attribution::Inferred => "  (best guess)",
+        };
+        lines.push(format!("  PID {} - {who}{suffix}", instance.pid));
+    }
+
+    let untracked = roblox_instance_count.saturating_sub(tracked.len());
+    if untracked > 0 {
+        lines.push(format!(
+            "{untracked} other instance(s) not matched to an account."
+        ));
+    }
+    lines.join("\n")
+}
+
 // ---------------------------------------------------------------------------
 // Tabs
 // ---------------------------------------------------------------------------
@@ -37,6 +146,8 @@ enum Tab {
     Accounts,
     PrivateServers,
     Presets,
+    /// Only reachable while `config.developer_options` is on.
+    AssetManager,
     Settings,
 }
 
@@ -63,8 +174,6 @@ struct AddAccountDialog {
     open: bool,
     step: AddAccountStep,
     cookie_input: String,
-    /// Staging field for password — only committed on submit.
-    password_input: String,
     /// True while we're waiting for the backend to validate.
     loading: bool,
     /// Error message from the last failed attempt.
@@ -107,7 +216,7 @@ struct AddAccountDialog {
 /// tokens are dropped and surrounding quotes/whitespace are trimmed.
 fn parse_bulk_cookies(input: &str) -> Vec<String> {
     input
-        .split(|c: char| matches!(c, '\n' | '\r' | ',' | ';' | '\t'))
+        .split(['\n', '\r', ',', ';', '\t'])
         .map(|s| s.trim().trim_matches('"').trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
@@ -129,7 +238,14 @@ pub struct AppState {
     config: AppConfig,
     config_path: PathBuf,
     store: AccountStore,
-    master_password: String,
+    /// Holds the unlocked store's data key. `None` until the store is opened,
+    /// which for a device-mode store happens automatically at startup and for a
+    /// password-mode store happens when the user types their password.
+    ///
+    /// Replaces the old `master_password: String`: the password itself is no
+    /// longer kept around after unlock, and an empty string is no longer
+    /// overloaded to mean "not unlocked yet".
+    store_session: Option<ram_core::crypto::StoreSession>,
 
     bridge: BackendBridge,
     toasts: Toasts,
@@ -141,6 +257,7 @@ pub struct AppState {
     main_panel_state: main_panel::MainPanelState,
     private_servers_state: private_servers::PrivateServerState,
     presets_state: presets_panel::PresetsState,
+    asset_manager_state: asset_manager::AssetManagerState,
     settings_state: settings::SettingsState,
     add_dialog: AddAccountDialog,
 
@@ -160,25 +277,127 @@ pub struct AppState {
     /// Downloaded game icon bytes, keyed by place ID.
     game_icon_bytes: HashMap<u64, Vec<u8>>,
 
+    /// Every asset this app has staged or uploaded. Loaded unconditionally,
+    /// even when `developer_options` is off, so toggling the setting can never
+    /// strand an upload that is still being moderated.
+    asset_index: ram_core::assets::AssetIndex,
+    asset_index_path: PathBuf,
+    /// Set when the index on disk was written by a newer build or could not be
+    /// read. Blocks saving so we cannot destroy what we cannot represent.
+    asset_index_read_only: bool,
+    /// Index has unsaved changes; flushed by the debounce timer and on exit.
+    asset_index_dirty: bool,
+    /// Rows waiting on the upload confirmation modal.
+    pending_upload_rows: Vec<String>,
+    /// Universes the acting account manages, and who they were fetched for.
+    /// Possibly empty: the listing endpoint is provisional and the manual ID
+    /// field in the grant dialog is the guaranteed path.
+    universe_targets: Vec<ram_core::assets_api::UniverseTarget>,
+    universe_targets_user: Option<u64>,
+    /// Groups the acting account belongs to, as candidate publish targets.
+    publish_groups: Vec<ram_core::assets_api::GroupTarget>,
+    /// The inventory page currently loaded in the browse pane.
+    remote_inventory: asset_manager::RemoteInventory,
+    /// Thumbnail PNGs for the icon views, keyed by asset ID.
+    asset_thumbnails: HashMap<u64, Vec<u8>>,
+    /// Requests currently in flight, so the same asset is not asked for on
+    /// every frame while one is outstanding.
+    asset_thumbnails_inflight: HashSet<u64>,
+    /// Earliest time to ask again for an asset Roblox has not rendered yet.
+    ///
+    /// Without this a first miss was permanent: old assets whose thumbnails
+    /// have aged out come back as `Pending`, and the tile stayed a placeholder
+    /// for the rest of the session even after Roblox caught up.
+    asset_thumbnails_retry_at: HashMap<u64, std::time::Instant>,
+
     /// User IDs currently visible in the sidebar (after search filtering).
     visible_user_ids: Vec<u64>,
 
-    /// Cached flag from sysinfo (refreshed lazily).
+    /// Cached flag, refreshed from `BackendEvent::InstancesUpdated`.
     roblox_running: bool,
+    /// Every running Roblox client, whoever started it. Cached rather than
+    /// counted per frame: `sysinfo` has to walk the whole process table, which
+    /// is not something to do on the paint thread at 60fps.
+    roblox_instance_count: usize,
+    /// Clients RM launched, and the account each belongs to. Mostly read off
+    /// the client's own command line and therefore exact; see
+    /// [`ram_core::instances`] for when it is not, and check
+    /// `TrackedInstance::attribution` before acting destructively.
+    tracked_instances: Vec<ram_core::instances::TrackedInstance>,
+    /// What each client's window was called before RM renamed it, so switching
+    /// the feature off puts things back instead of leaving Roblox wearing our
+    /// labels. Refreshed whenever Roblox rewrites its own title, so this holds
+    /// Roblox's latest intent and not the "Roblox" placeholder we first
+    /// displaced. Keyed by PID; entries are dropped when the client exits.
+    original_window_titles: std::collections::HashMap<u32, String>,
+    /// Previous frame's value of `config.rename_roblox_windows`, so the moment
+    /// the user unticks it can be noticed and acted on.
+    renaming_was_enabled: bool,
+    /// When RM last asked for a launch. Sweeps run faster for a short while
+    /// afterwards, because that is the only window in which the delay between a
+    /// client appearing and being named is something the user is watching for.
+    last_launch_request: Option<std::time::Instant>,
     /// Frame counter to throttle background refreshes.
     frame_count: u64,
     /// Wall-clock timestamp of the last tray-kill sweep. Frame-counter timers
     /// don't fire reliably in eframe's reactive mode (update() only runs on
     /// input), so periodic background work uses real time instead.
     last_tray_kill: Option<std::time::Instant>,
+    /// Wall-clock timestamps for the background refresh timers, same reasoning
+    /// as `last_tray_kill`. The repaint rate swings between ~0.5fps when idle
+    /// and 60fps while anything animates, so a frame count is off by 120x
+    /// depending on what the UI happens to be doing.
+    last_presence_poll: Option<std::time::Instant>,
+    last_avatar_refresh: Option<std::time::Instant>,
+    last_revalidation: Option<std::time::Instant>,
+    last_instance_sweep: Option<std::time::Instant>,
+    /// Poll cadence for in-flight asset uploads. Interval is adaptive, so
+    /// unlike the timers above it is recomputed each tick from the age of the
+    /// oldest pending operation.
+    last_asset_poll: Option<std::time::Instant>,
+    /// Poll cadence for assets waiting on a moderation verdict. Its own timer
+    /// because reviews outlast operations by orders of magnitude.
+    last_moderation_poll: Option<std::time::Instant>,
+    /// Ticks the upload pump so a row held back by its retry backoff or by
+    /// audio spacing gets picked up without waiting for another event.
+    last_upload_pump: Option<std::time::Instant>,
+    /// When the last audio upload was dispatched, for
+    /// [`RmApp::AUDIO_UPLOAD_SPACING`].
+    last_audio_upload: Option<std::time::Instant>,
+    /// Debounce for asset index writes. A batch of uploads would otherwise fire
+    /// one atomic write per state change.
+    last_asset_index_save: Option<std::time::Instant>,
     /// Wall-clock timestamp of the last user-initiated game launch. Used to
     /// enforce `config.launch_delay_secs` so the user can't trigger another
     /// single/quick launch inside the cooldown window.
     last_launch: Option<std::time::Instant>,
 
-    /// Password prompt shown on first launch when store file exists.
+    /// Password prompt shown on first launch when the store on disk is
+    /// password-locked. A device-mode store opens without ever setting this.
     needs_unlock: bool,
     unlock_password_input: String,
+    /// The password that just unlocked the store, held only long enough to
+    /// re-encrypt a legacy store under it. Cleared as soon as the upgrade
+    /// round-trip returns.
+    unlock_password_used: String,
+    /// Set while the startup unlock is in flight so the unlock screen shows a
+    /// spinner instead of flashing an empty password box.
+    unlocking: bool,
+    /// Show the recovery dialog offered on the unlock screen, which explains
+    /// what is and is not recoverable before offering to wipe the store.
+    show_recovery: bool,
+    /// Typed confirmation guarding the wipe in the recovery dialog.
+    recovery_confirm_input: String,
+    /// The store opened, but it predates the envelope format. Set until the
+    /// upgrade round-trip finishes.
+    pending_legacy_upgrade: bool,
+    /// Offer to stop asking for a password, shown once after an existing
+    /// password user unlocks. Their answer is recorded in
+    /// `config.offered_passwordless` either way.
+    show_passwordless_offer: bool,
+    /// The store is device-locked but this machine's key is gone, so no
+    /// password can open it. Drives a different unlock screen.
+    device_key_missing: bool,
 
     /// When set, shows a confirmation dialog before removing the account.
     confirm_remove: Option<u64>,
@@ -195,7 +414,20 @@ pub struct AppState {
 impl AppState {
     pub fn new(mut config: AppConfig, config_path: PathBuf) -> Self {
         let bridge = BackendBridge::spawn();
-        let needs_unlock = config.accounts_path.is_file();
+
+        // How the store on disk is locked decides whether the user sees
+        // anything at all before the app opens. A read error here (unreadable
+        // file, permissions) is treated as "password-locked": the unlock screen
+        // can explain itself, whereas the main UI would just look empty.
+        let store_mode = match ram_core::crypto::peek_mode(&config.accounts_path) {
+            Ok(mode) => mode,
+            Err(e) => {
+                tracing::warn!("Could not read the account store header: {e}");
+                Some(ram_core::crypto::StoreMode::Password)
+            }
+        };
+        let needs_unlock = store_mode.is_some();
+        let unlock_silently = store_mode == Some(ram_core::crypto::StoreMode::Device);
 
         // If multi-instance was previously enabled, run the same validation as
         // the UI toggle: kill tray processes, wait, then only acquire the mutex
@@ -215,6 +447,14 @@ impl AppState {
             }
         }
 
+        // Loaded regardless of `developer_options`: a user who uploads, hides
+        // the tab, then reopens the app must not silently lose an upload that
+        // was still being moderated.
+        let asset_index_path = ram_core::assets::index_path(&crate::data_dir());
+        let (asset_index, asset_index_status) =
+            ram_core::assets::AssetIndex::load(&asset_index_path);
+        let asset_index_read_only = asset_index_status.is_read_only();
+
         let mut sidebar_state = sidebar::SidebarState::default();
         sidebar_state.sort_order = match config.sort_mode.as_str() {
             "Name" => sidebar::SortOrder::Name,
@@ -222,11 +462,13 @@ impl AppState {
             _ => sidebar::SortOrder::Custom,
         };
 
+        let renaming_enabled_at_start = config.rename_roblox_windows;
+
         let mut state = Self {
             config,
             config_path,
             store: AccountStore::default(),
-            master_password: String::new(),
+            store_session: None,
             bridge,
             toasts: Toasts::default(),
             active_tab: Tab::Accounts,
@@ -235,6 +477,7 @@ impl AppState {
             main_panel_state: main_panel::MainPanelState::default(),
             private_servers_state: private_servers::PrivateServerState::default(),
             presets_state: presets_panel::PresetsState::default(),
+            asset_manager_state: asset_manager::AssetManagerState::default(),
             settings_state: settings::SettingsState::default(),
             add_dialog: AddAccountDialog::default(),
             presets: Vec::new(),
@@ -242,18 +485,67 @@ impl AppState {
             avatar_bytes: HashMap::new(),
             anonymized_avatar_bytes: HashMap::new(),
             game_icon_bytes: HashMap::new(),
+            asset_index,
+            asset_index_path,
+            asset_index_read_only,
+            asset_index_dirty: false,
+            pending_upload_rows: Vec::new(),
+            universe_targets: Vec::new(),
+            universe_targets_user: None,
+            publish_groups: Vec::new(),
+            remote_inventory: asset_manager::RemoteInventory::default(),
+            asset_thumbnails: HashMap::new(),
+            asset_thumbnails_inflight: HashSet::new(),
+            asset_thumbnails_retry_at: HashMap::new(),
             visible_user_ids: Vec::new(),
             roblox_running: false,
+            roblox_instance_count: 0,
+            tracked_instances: Vec::new(),
+            original_window_titles: std::collections::HashMap::new(),
+            // Read before `config` is moved into the struct below.
+            renaming_was_enabled: renaming_enabled_at_start,
+            last_launch_request: None,
             frame_count: 0,
             last_tray_kill: None,
+            // Seeded to "now" so the first tick lands one full interval in,
+            // rather than firing a redundant round at startup (StoreUnlocked
+            // already kicks off a refresh and revalidation).
+            last_presence_poll: Some(std::time::Instant::now()),
+            last_avatar_refresh: Some(std::time::Instant::now()),
+            last_revalidation: Some(std::time::Instant::now()),
+            // Not seeded: the first frame should establish what is running
+            // rather than showing "nothing" for two seconds.
+            last_instance_sweep: None,
+            // Not seeded: if a previous run left operations pending, they
+            // should be polled on the first frame, not one interval later.
+            last_asset_poll: None,
+            last_moderation_poll: None,
+            last_upload_pump: None,
+            last_audio_upload: None,
+            last_asset_index_save: None,
             last_launch: None,
             needs_unlock,
             unlock_password_input: String::new(),
+            unlock_password_used: String::new(),
+            unlocking: unlock_silently,
+            show_recovery: false,
+            recovery_confirm_input: String::new(),
+            pending_legacy_upgrade: false,
+            show_passwordless_offer: false,
+            device_key_missing: false,
             confirm_remove: None,
             update_available: None,
             show_changelog: false,
             tutorial: tutorial::TutorialState::default(),
         };
+
+        // A device-locked store needs no interaction: open it now so the first
+        // frame the user sees is the account list, not a password box.
+        if unlock_silently {
+            state.bridge.send(BackendCommand::UnlockWithDevice {
+                path: state.config.accounts_path.clone(),
+            });
+        }
 
         // Check for updates on startup
         state.bridge.send(BackendCommand::CheckForUpdates {
@@ -265,6 +557,9 @@ impl AppState {
 
         // Initial load of preset files from disk.
         state.reload_presets();
+
+        // Reconcile any uploads left mid-flight by the previous run.
+        state.recover_asset_index();
 
         // Detect first launch after update
         let current = env!("CARGO_PKG_VERSION");
@@ -286,6 +581,227 @@ impl AppState {
     }
 
     // ---- Event processing ----
+
+    /// Human-readable version of the PID-to-account map, for the hover text on
+    /// the running-instance counter.
+    ///
+    /// Lines that came from reading the client's command line are stated
+    /// plainly; the ones that fell back to guessing are marked. See
+    /// [`ram_core::instances`] for what separates them.
+    /// Name each attributed client's window after its account, so tiled clients
+    /// are tellable apart.
+    ///
+    /// Called from the sweep result rather than from a timer of its own, which
+    /// is also the reapply loop: Roblox rewrites its own title as it loads (it
+    /// comes up as "Roblox" and becomes the place name once in-game), so a
+    /// title set once at launch does not survive. `apply_instance_titles` reads
+    /// the current title first and only writes when it differs, so the steady
+    /// state costs one `GetWindowTextW` per client every two seconds and no
+    /// writes at all.
+    fn retitle_roblox_windows(&mut self) {
+        // Opt-in. This is the only place RM writes to a Roblox window instead of
+        // merely reading or repositioning it, so it stays off until asked for.
+        if !self.config.rename_roblox_windows {
+            return;
+        }
+        // Forget clients that have exited, so the restore list cannot grow for
+        // the life of the session or name a PID that has since been reused.
+        let live: std::collections::HashSet<u32> =
+            self.tracked_instances.iter().map(|i| i.pid).collect();
+        self.original_window_titles.retain(|pid, _| live.contains(pid));
+
+        let titles = instance_window_titles(
+            &self.tracked_instances,
+            &self.store.accounts,
+            self.config.anonymize_names,
+        );
+        if titles.is_empty() {
+            return;
+        }
+        // Whatever we displaced is what Roblox last wanted the window called.
+        // Recording it on every rewrite (not just the first) is what keeps the
+        // restore from putting back the "Roblox" placeholder shown while the
+        // client was still loading.
+        for (pid, previous) in ram_core::process::apply_instance_titles(&titles) {
+            self.original_window_titles.insert(pid, previous);
+        }
+    }
+
+    /// Put every window RM renamed back the way Roblox had it.
+    ///
+    /// Called when the setting is switched off and again on exit. Leaving
+    /// Roblox wearing RM's labels after RM has stopped managing them, or after
+    /// it has closed entirely, is a mess the user cannot undo without
+    /// restarting the client.
+    fn restore_roblox_window_titles(&mut self) {
+        if self.original_window_titles.is_empty() {
+            return;
+        }
+        let originals: Vec<(u32, String)> = self
+            .original_window_titles
+            .iter()
+            .map(|(pid, title)| (*pid, title.clone()))
+            .collect();
+        ram_core::process::restore_instance_titles(&originals);
+        self.original_window_titles.clear();
+    }
+
+    /// Bring one account's client to the front.
+    ///
+    /// Run inline on the UI thread rather than queued to the backend on
+    /// purpose. `SetForegroundWindow` is granted to the process that already
+    /// owns the foreground window, and at this moment that is RM, because the
+    /// user just clicked a menu item in it. Handing the call to another thread
+    /// via a channel would only widen the gap in which that stops being true.
+    fn focus_instance(&mut self, pid: u32) {
+        if ram_core::process::focus_instance(pid) {
+            return;
+        }
+        self.toasts.push(Toast::error(format!(
+            "Could not bring PID {pid} to the front. Windows refused, or the client has no window yet."
+        )));
+    }
+
+    /// Kill one account's client, after `ram_core` re-verifies it is really
+    /// that client.
+    ///
+    /// This does not trust `tracked_instances`. It passes the recorded launch
+    /// token down, and the kill only happens if the live process still carries
+    /// it. Everything this function decides is presentation: which instance the
+    /// user meant, and what to say when the verification refuses.
+    fn kill_instance(&mut self, pid: u32) {
+        let Some(instance) = self
+            .tracked_instances
+            .iter()
+            .find(|i| i.pid == pid)
+            .cloned()
+        else {
+            self.toasts.push(Toast::error(
+                "That client is no longer being tracked. Nothing was killed.",
+            ));
+            return;
+        };
+        // An inferred mapping has no confirmed token, so verification cannot
+        // pass and the kill would fail with a confusing message. Say the real
+        // reason instead, and do not pretend the option was live.
+        if !instance.attribution.is_exact() {
+            self.toasts.push(Toast::error(
+                "RM could not read that client's command line, so it cannot \
+                 confirm which account it belongs to. Use Kill All instead.",
+            ));
+            return;
+        }
+        match ram_core::process::kill_verified_instance(pid, instance.launchtime) {
+            Ok(()) => {
+                let who = account_display_label(
+                    &self.store.accounts,
+                    instance.user_id,
+                    self.config.anonymize_names,
+                );
+                self.toasts.push(Toast::info(format!("Closed {who}'s client")));
+                // The sweep reaps the mapping within a couple of seconds, but
+                // dropping it now keeps the menu from offering a dead PID in
+                // the meantime.
+                self.tracked_instances.retain(|i| i.pid != pid);
+            }
+            Err(e) => self.toasts.push(Toast::error(e.to_string())),
+        }
+    }
+
+    /// Launch `user_id` into whatever server `target_user_id` is in.
+    ///
+    /// Goes through the ordinary `LaunchGame` command rather than a path of its
+    /// own, so multi-instance, privacy mode, the tray kill, and the launch
+    /// delay all apply exactly as they do to any other launch. The only thing
+    /// this adds is where to land.
+    ///
+    /// The place and job come from the target's cached presence, which the
+    /// sidebar refreshes every ten seconds. That is the weak point and it is
+    /// unavoidable: there is no way to ask Roblox "is job X still alive"
+    /// without walking the whole server list for the place. If the server has
+    /// closed in the meantime, Roblox rejects the join rather than silently
+    /// dropping the account somewhere else, so the failure is at least visible
+    /// to the user in the client.
+    fn join_account_server(&mut self, user_id: u64, target_user_id: u64) {
+        let target = self.store.find_by_id(target_user_id).map(|a| {
+            (
+                account_display_label(
+                    &self.store.accounts,
+                    target_user_id,
+                    self.config.anonymize_names,
+                ),
+                a.last_presence.clone(),
+            )
+        });
+        let Some((target_name, presence)) = target else {
+            self.toasts
+                .push(Toast::error("That account is no longer in the list."));
+            return;
+        };
+
+        // Two distinct reasons the join cannot happen, worth separate wording:
+        // the account is not playing, versus it is playing but Roblox is not
+        // telling RM where. The second happens when the target's join privacy
+        // hides the server, and "not in a game" would be a lie.
+        if presence.user_presence_type != 2 {
+            self.toasts.push(Toast::error(format!(
+                "{target_name} is not in a game right now."
+            )));
+            return;
+        }
+        let (Some(place_id), Some(job_id)) = (presence.place_id, presence.game_id.clone()) else {
+            self.toasts.push(Toast::error(format!(
+                "Roblox is not reporting which server {target_name} is in, so RM \
+                 cannot follow. Their join privacy setting may be hiding it."
+            )));
+            return;
+        };
+
+        let Some(account) = self
+            .store
+            .find_by_id(user_id)
+            .map(|a| (a.user_id, a.encrypted_cookie.clone()))
+        else {
+            self.toasts
+                .push(Toast::error("That account is no longer in the list."));
+            return;
+        };
+        // Check the session before spending the launch slot, so a locked store
+        // does not eat the user's next launch window.
+        let Some(session) = self.session() else {
+            self.toasts
+                .push(Toast::error("Unlock the store before launching."));
+            return;
+        };
+        if !self.try_consume_launch_slot() {
+            return;
+        }
+
+        self.bridge.send(BackendCommand::LaunchGame {
+            user_id: account.0,
+            encrypted_cookie: account.1,
+            session,
+            use_credential_manager: self.config.use_credential_manager,
+            place_id,
+            job_id: Some(job_id),
+            link_code: None,
+            access_code: None,
+            multi_instance: self.config.multi_instance_enabled,
+            kill_background: self.config.kill_background_roblox,
+            privacy_mode: self.config.privacy_mode,
+        });
+        self.toasts
+            .push(Toast::info(format!("Joining {target_name}'s server")));
+    }
+
+    fn instance_attribution_summary(&self) -> String {
+        attribution_summary(
+            &self.tracked_instances,
+            &self.store.accounts,
+            self.config.anonymize_names,
+            self.roblox_instance_count,
+        )
+    }
 
     fn process_events(&mut self) {
         for event in self.bridge.poll() {
@@ -334,7 +850,6 @@ impl AppState {
                         self.add_dialog.loading = false;
                         self.add_dialog.last_error = None;
                         self.add_dialog.cookie_input.clear();
-                        self.add_dialog.password_input.clear();
                         self.add_dialog.browser_login_pending = false;
                         self.add_dialog.browser_login_rx = None;
                         self.add_dialog.rejected_cookie = None;
@@ -371,12 +886,21 @@ impl AppState {
                     }
                 }
                 BackendEvent::GameLaunched => {
+                    // Start the fast-sweep window here rather than at each of the
+                    // six call sites that can ask for a launch. The client does
+                    // not exist yet either way, so this is still well ahead of
+                    // anything there is to attribute.
+                    self.last_launch_request = Some(std::time::Instant::now());
                     self.toasts.push(Toast::success("Game launched"));
                     if self.config.auto_arrange_windows {
                         self.bridge.send(BackendCommand::ArrangeWindows);
                     }
                 }
                 BackendEvent::BulkLaunchProgress { launched, total } => {
+                    // Each iteration re-arms the window, so a long bulk launch
+                    // stays responsive to its last client rather than to its
+                    // first.
+                    self.last_launch_request = Some(std::time::Instant::now());
                     self.toasts
                         .push(Toast::info(format!("Launching {launched}/{total}...")));
                 }
@@ -397,13 +921,86 @@ impl AppState {
                 BackendEvent::StoreSaved => {
                     // silent
                 }
-                BackendEvent::StoreLoaded(store) => {
-                    self.store = store;
+                BackendEvent::StoreUnlocked {
+                    store,
+                    session,
+                    legacy,
+                } => {
+                    let was_password = session.needs_password();
+                    self.store = *store;
+                    self.store_session = Some(*session);
                     self.needs_unlock = false;
-                    self.toasts
-                        .push(Toast::success("Account store unlocked"));
-                    self.trigger_refresh();
-                    self.trigger_revalidation();
+                    self.unlocking = false;
+                    self.device_key_missing = false;
+                    self.unlock_password_input.clear();
+
+                    if legacy {
+                        // Pre-envelope file. Rotate it onto a fresh data key
+                        // before anything can try to save through the old one;
+                        // `auto_save` refuses to write a legacy session for
+                        // exactly this window.
+                        self.pending_legacy_upgrade = true;
+                        self.bridge.send(BackendCommand::RekeyStore {
+                            store: self.store.clone(),
+                            path: self.config.accounts_path.clone(),
+                            session: self
+                                .store_session
+                                .clone()
+                                .expect("session was just set"),
+                            // Keep the password they already have; the offer to
+                            // drop it comes after, as an explicit choice.
+                            new_password: Some(self.unlock_password_used.clone()),
+                            upgrade_legacy: true,
+                        });
+                    } else {
+                        // Only toast when the user actually did something. A
+                        // device-mode store opens before the window is drawn,
+                        // and announcing that is noise.
+                        if was_password {
+                            self.toasts.push(Toast::success("Account store unlocked"));
+                        }
+                        self.offer_passwordless_if_due();
+
+                        // Held back during an upgrade: the backend re-keys a
+                        // clone of the store taken just above, so anything a
+                        // refresh wrote into `self.store` in the meantime would
+                        // be discarded when the upgraded copy replaces it.
+                        self.trigger_refresh();
+                        self.trigger_revalidation();
+                    }
+                }
+                BackendEvent::StoreRekeyed { store, session } => {
+                    let upgraded = self.pending_legacy_upgrade;
+                    self.store_session = Some(*session);
+                    self.pending_legacy_upgrade = false;
+                    self.unlock_password_used.clear();
+
+                    if upgraded {
+                        // Only an upgrade rewrites account data (every cookie
+                        // is re-encrypted). A plain rewrap returns the same
+                        // store it was given, and adopting that stale clone
+                        // would discard anything a refresh landed meanwhile.
+                        self.store = *store;
+                        tracing::info!("Upgraded the account store to the envelope format");
+                        self.offer_passwordless_if_due();
+                        // Deferred from StoreUnlocked, above.
+                        self.trigger_refresh();
+                        self.trigger_revalidation();
+                    } else {
+                        let msg = match self.store_session.as_ref().map(|s| s.needs_password()) {
+                            Some(true) => "Master password set",
+                            _ => "This PC now unlocks your accounts automatically",
+                        };
+                        self.toasts.push(Toast::success(msg));
+                        // The backend wrote the clone it was handed. Save again
+                        // under the new session so any change that landed while
+                        // the re-key was in flight reaches disk too.
+                        self.auto_save();
+                    }
+                }
+                BackendEvent::DeviceKeyMissing => {
+                    self.unlocking = false;
+                    self.device_key_missing = true;
                 }
                 BackendEvent::Killed(count) => {
                     self.toasts
@@ -411,6 +1008,15 @@ impl AppState {
                 }
                 BackendEvent::WindowsArranged => {
                     // silent — arrangement complete
+                }
+                BackendEvent::InstancesUpdated {
+                    instances,
+                    running_count,
+                } => {
+                    self.tracked_instances = instances;
+                    self.roblox_instance_count = running_count;
+                    self.roblox_running = running_count > 0;
+                    self.retitle_roblox_windows();
                 }
                 BackendEvent::AccountRevalidated {
                     user_id,
@@ -510,6 +1116,11 @@ impl AppState {
                     }
                 }
                 BackendEvent::Error(msg) => {
+                    // A failed unlock or re-key must clear its in-flight flag,
+                    // or the unlock screen sits on a spinner with no way back.
+                    self.unlocking = false;
+                    self.pending_legacy_upgrade = false;
+
                     if self.add_dialog.bulk_running {
                         // Don't toast or block the dialog mid-batch — count
                         // the failure and move on. The summary screen reports
@@ -592,7 +1203,6 @@ impl AppState {
                     self.add_dialog.loading = false;
                     self.add_dialog.last_error = None;
                     self.add_dialog.cookie_input.clear();
-                    self.add_dialog.password_input.clear();
                     self.add_dialog.browser_login_pending = false;
                     self.add_dialog.browser_login_rx = None;
                     self.add_dialog.rejected_cookie = None;
@@ -627,18 +1237,296 @@ impl AppState {
                         self.add_dialog.rejected_cookie = Some(cookie);
                     }
                 }
+                BackendEvent::AssetUploadStarted {
+                    row_id,
+                    file_sha256,
+                    file_bytes,
+                } => {
+                    if let Some(record) = self.asset_index.get_mut(&row_id) {
+                        record.file_sha256 = file_sha256;
+                        record.file_bytes = file_bytes;
+                    }
+                    // Flushed rather than debounced: the hash is what lets a
+                    // crash-interrupted upload be recognised as already done
+                    // instead of being sent a second time.
+                    self.save_asset_index();
+                }
+                BackendEvent::AssetOperationCreated {
+                    row_id,
+                    operation,
+                    started_at,
+                } => {
+                    if let Some(record) = self.asset_index.get_mut(&row_id) {
+                        record.state = AssetState::Pending {
+                            operation,
+                            since: started_at,
+                        };
+                        record.updated_at = Some(started_at);
+                    }
+                    // Flush immediately rather than waiting for the debounce.
+                    // This is the one write that makes an upload survivable
+                    // across a crash: without the operation ID on disk there is
+                    // nothing to resume.
+                    self.save_asset_index();
+                }
+                BackendEvent::AssetOperationResolved { row_id, outcome } => {
+                    self.apply_operation_outcome(&row_id, outcome);
+                }
+                BackendEvent::AssetModerationResolved { row_id, status } => {
+                    self.apply_moderation_status(&row_id, status);
+                }
+                BackendEvent::AssetUploadFailed {
+                    row_id,
+                    message,
+                    retryable,
+                } => {
+                    self.fail_upload(&row_id, message, retryable);
+                }
+                BackendEvent::AssetPollBatchDone => {}
+                BackendEvent::AssetPermissionsGranted {
+                    universe_id,
+                    row_ids,
+                    granted,
+                    refused,
+                } => {
+                    for row_id in &row_ids {
+                        if let Some(record) = self.asset_index.get_mut(row_id) {
+                            if !record.granted_universes.contains(&universe_id) {
+                                record.granted_universes.push(universe_id);
+                            }
+                            // One-shot: an auto-grant that already fired must
+                            // not fire again if the row is somehow re-resolved.
+                            record.auto_grant_universe = None;
+                        }
+                    }
+                    self.save_asset_index();
+                    // A 200 can still carry per-asset refusals, so say what
+                    // actually landed rather than reporting the batch size.
+                    self.toasts.push(if refused > 0 {
+                        Toast::warning(format!(
+                            "Granted {granted} asset(s) to universe {universe_id}, {refused} refused. See the log for which."
+                        ))
+                    } else {
+                        Toast::success(format!(
+                            "Granted {granted} asset(s) to universe {universe_id}"
+                        ))
+                    });
+                }
+                BackendEvent::AssetPermissionsFailed {
+                    universe_id,
+                    message,
+                } => {
+                    self.toasts.push(Toast::error(format!(
+                        "Could not grant access to universe {universe_id}: {message}"
+                    )));
+                }
+                BackendEvent::UniverseTargetsFetched {
+                    user_id,
+                    universes,
+                    resolved_place,
+                } => {
+                    self.universe_targets = universes;
+                    self.universe_targets_user = Some(user_id);
+                    if let Some((place_id, universe_id)) = resolved_place {
+                        self.asset_manager_state.grant_universe = Some(universe_id);
+                        self.toasts.push(Toast::info(format!(
+                            "Place {place_id} is universe {universe_id}"
+                        )));
+                    }
+                }
+                BackendEvent::PublishGroupsFetched { user_id, groups } => {
+                    // Ignore a late reply for an account the user has since
+                    // switched away from.
+                    if self.asset_manager_state.acting_user_id == Some(user_id) {
+                        self.publish_groups = groups;
+                    }
+                }
+                BackendEvent::CreationsFetched {
+                    creator,
+                    kind,
+                    appended: _,
+                    page,
+                    error,
+                } => {
+                    let node = asset_manager::TreeNode::Inventory(creator);
+                    // A fan-out request for a kind the user has since filtered
+                    // away, or for a node they navigated off, is stale.
+                    let wanted = self.remote_inventory.node == Some(node)
+                        && self
+                            .remote_inventory
+                            .filter
+                            .is_none_or(|selected| selected == kind);
+                    if !wanted {
+                        continue;
+                    }
+
+                    self.remote_inventory.inflight =
+                        self.remote_inventory.inflight.saturating_sub(1);
+                    match page.next_cursor {
+                        Some(cursor) => {
+                            self.remote_inventory.cursors.insert(kind, cursor);
+                        }
+                        None => {
+                            self.remote_inventory.cursors.remove(&kind);
+                        }
+                    }
+                    // Always append: with a fan-out, each reply carries one
+                    // kind's slice of the whole. Replacing would leave only the
+                    // last kind to answer.
+                    //
+                    // Deduped by asset ID because a filter change mid-fan-out
+                    // can let a reply from the superseded request through, and
+                    // a doubled row is worse than a slightly late one.
+                    for item in page.items {
+                        if !self
+                            .remote_inventory
+                            .items
+                            .iter()
+                            .any(|existing| existing.asset_id == item.asset_id)
+                        {
+                            self.remote_inventory.items.push(item);
+                        }
+                    }
+
+                    // One kind failing must not blank the kinds that worked, so
+                    // an error is only surfaced once nothing is still in flight
+                    // and nothing at all came back.
+                    if let Some(message) = error {
+                        if self.remote_inventory.inflight == 0
+                            && self.remote_inventory.items.is_empty()
+                        {
+                            self.remote_inventory.error = Some(message);
+                        }
+                    }
+                }
+                BackendEvent::AssetThumbnailsReady { requested, images } => {
+                    let now = std::time::Instant::now();
+                    let mut resolved = HashSet::new();
+                    for (asset_id, bytes) in images {
+                        resolved.insert(asset_id);
+                        self.asset_thumbnails.insert(asset_id, bytes);
+                    }
+                    for asset_id in requested {
+                        self.asset_thumbnails_inflight.remove(&asset_id);
+                        if resolved.contains(&asset_id) {
+                            self.asset_thumbnails_retry_at.remove(&asset_id);
+                        } else {
+                            // Roblox is still rendering it, so ask again later
+                            // rather than leaving a permanent placeholder.
+                            self.asset_thumbnails_retry_at
+                                .insert(asset_id, now + Self::THUMBNAIL_RETRY);
+                        }
+                    }
+                }
             }
         }
     }
 
-    fn auto_save(&self) {
-        if !self.master_password.is_empty() {
-            self.bridge.send(BackendCommand::SaveStore {
-                store: self.store.clone(),
-                path: self.config.accounts_path.clone(),
-                password: self.master_password.clone(),
-            });
+    /// The unlocked store session, if there is one.
+    ///
+    /// Every command that touches a cookie needs this. It is `None` only before
+    /// the store is unlocked or while a legacy store is mid-upgrade, and the UI
+    /// paths that could send such a command are gated behind `needs_unlock`.
+    fn session(&self) -> Option<ram_core::crypto::StoreSession> {
+        self.store_session.clone()
+    }
+
+    /// The session to save under, creating a device-mode one on first use.
+    ///
+    /// This is what makes passwordless the default: a brand-new install gets a
+    /// data key wrapped by the OS credential store the moment it has something
+    /// to save, with nothing to prompt for. Returns `None` only when the
+    /// credential store is unavailable, which callers report rather than
+    /// silently writing the store out unencrypted.
+    fn ensure_session(&mut self) -> Option<ram_core::crypto::StoreSession> {
+        if let Some(s) = &self.store_session {
+            return Some(s.clone());
         }
+        match ram_core::crypto::create_device_session() {
+            Ok(s) => {
+                tracing::info!("Created a device-locked account store");
+                self.store_session = Some(s.clone());
+                Some(s)
+            }
+            Err(e) => {
+                tracing::error!("Could not create a device-locked store: {e}");
+                self.toasts.push(Toast::error(format!(
+                    "Could not set up encryption: {e}. Set a master password in Settings instead."
+                )));
+                None
+            }
+        }
+    }
+
+    /// Show the one-time offer to stop requiring a master password.
+    ///
+    /// Only fires for someone who actually has a password to drop, and only
+    /// once: `config.offered_passwordless` is set as soon as they answer, so
+    /// declining sticks. New installs are passwordless already and never see it.
+    fn offer_passwordless_if_due(&mut self) {
+        if self.config.offered_passwordless {
+            return;
+        }
+        let has_password = self
+            .store_session
+            .as_ref()
+            .is_some_and(|s| s.needs_password());
+        if !has_password {
+            // Nothing to offer, but record that we got here so a user who later
+            // sets a password on purpose is not second-guessed about it.
+            self.config.offered_passwordless = true;
+            let _ = self.config.save(&self.config_path);
+            return;
+        }
+        self.show_passwordless_offer = true;
+    }
+
+    /// Record the user's answer to the passwordless offer so it is asked once.
+    fn dismiss_passwordless_offer(&mut self) {
+        self.show_passwordless_offer = false;
+        self.config.offered_passwordless = true;
+        if let Err(e) = self.config.save(&self.config_path) {
+            tracing::warn!("Could not record the passwordless choice: {e}");
+        }
+    }
+
+    /// Switch the store between device and password locking. `None` drops the
+    /// password; `Some` sets or replaces it.
+    fn rekey_store(&mut self, new_password: Option<String>) {
+        let Some(session) = self.session() else {
+            self.toasts
+                .push(Toast::error("Unlock the account store first"));
+            return;
+        };
+        self.bridge.send(BackendCommand::RekeyStore {
+            store: self.store.clone(),
+            path: self.config.accounts_path.clone(),
+            session,
+            new_password,
+            upgrade_legacy: false,
+        });
+    }
+
+    /// Persist the store. Silently does nothing before the store is unlocked,
+    /// which is when there is no data worth writing anyway.
+    ///
+    /// Note this no longer keys off "is a password set": that older gate meant
+    /// credential-manager users, who never set one, never had their account
+    /// roster written to disk at all.
+    fn auto_save(&self) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        if session.is_legacy() {
+            // Mid-upgrade: saving now would write a store still keyed by the
+            // old unsalted KDF. The upgrade round-trip saves for us.
+            return;
+        }
+        self.bridge.send(BackendCommand::SaveStore {
+            store: self.store.clone(),
+            path: self.config.accounts_path.clone(),
+            session,
+        });
     }
 
     /// Pop the next queued cookie and dispatch an AddAccount for it. When the
@@ -648,10 +1536,19 @@ impl AppState {
     fn dispatch_next_bulk(&mut self) {
         match self.add_dialog.bulk_queue.pop() {
             Some(cookie) => {
+                // Creates the device-locked store on the first import into a
+                // fresh install. Failing here means no encryption is available,
+                // so the batch stops rather than proceeding unprotected.
+                let Some(session) = self.ensure_session() else {
+                    self.add_dialog.bulk_queue.clear();
+                    self.add_dialog.bulk_running = false;
+                    self.add_dialog.loading = false;
+                    return;
+                };
                 self.add_dialog.loading = true;
                 self.bridge.send(BackendCommand::AddAccount {
                     cookie,
-                    password: self.master_password.clone(),
+                    session: session.clone(),
                     use_credential_manager: self.config.use_credential_manager,
                 });
             }
@@ -667,13 +1564,22 @@ impl AppState {
 
     /// Get the first available cookie for API calls (decrypted from credential
     /// manager or in-memory encrypted cookie).
+    /// The account whose cookie the shared refresh calls (presence, avatars)
+    /// borrow. Skips accounts already known to have a dead cookie: those calls
+    /// fail on every poll otherwise, and since the polls are on a timer that
+    /// produced an endless stream of identical error toasts. Returning `None`
+    /// here is what stops the polling entirely once no usable cookie is left.
     fn first_account_with_cookie(&self) -> Option<&ram_core::models::Account> {
         self.store.accounts.iter().find(|a| {
-            self.config.use_credential_manager || a.encrypted_cookie.is_some()
+            !a.cookie_expired
+                && (self.config.use_credential_manager || a.encrypted_cookie.is_some())
         })
     }
 
     fn trigger_refresh(&self) {
+        let Some(session) = self.session() else {
+            return;
+        };
         let user_ids: Vec<u64> = self.store.accounts.iter().map(|a| a.user_id).collect();
         if user_ids.is_empty() {
             return;
@@ -683,7 +1589,7 @@ impl AppState {
                 user_ids,
                 first_user_id: first.user_id,
                 encrypted_cookie: first.encrypted_cookie.clone(),
-                password: self.master_password.clone(),
+                session: session.clone(),
                 use_credential_manager: self.config.use_credential_manager,
             });
         }
@@ -691,6 +1597,9 @@ impl AppState {
 
     /// Lightweight presence-only refresh for the currently visible accounts.
     fn trigger_presence_refresh(&self) {
+        let Some(session) = self.session() else {
+            return;
+        };
         if self.visible_user_ids.is_empty() {
             return;
         }
@@ -699,7 +1608,7 @@ impl AppState {
                 user_ids: self.visible_user_ids.clone(),
                 first_user_id: first.user_id,
                 encrypted_cookie: first.encrypted_cookie.clone(),
-                password: self.master_password.clone(),
+                session: session.clone(),
                 use_credential_manager: self.config.use_credential_manager,
             });
         }
@@ -770,6 +1679,9 @@ impl AppState {
     }
 
     fn open_browser_as(&mut self, user_id: u64) {
+        let Some(session) = self.session() else {
+            return;
+        };
         let Some(account) = self.store.find_by_id(user_id) else {
             return;
         };
@@ -790,7 +1702,7 @@ impl AppState {
         self.bridge.send(BackendCommand::BrowseAsAccount {
             user_id,
             encrypted_cookie: account.encrypted_cookie.clone(),
-            password: self.master_password.clone(),
+            session: session.clone(),
             use_credential_manager: self.config.use_credential_manager,
             profile_dir,
             label,
@@ -799,6 +1711,9 @@ impl AppState {
 
     /// Revalidate all account cookies in the background.
     fn trigger_revalidation(&self) {
+        let Some(session) = self.session() else {
+            return;
+        };
         if self.store.accounts.is_empty() {
             return;
         }
@@ -810,7 +1725,7 @@ impl AppState {
             .collect();
         self.bridge.send(BackendCommand::RevalidateAll {
             accounts,
-            password: self.master_password.clone(),
+            session: session.clone(),
             use_credential_manager: self.config.use_credential_manager,
         });
     }
@@ -821,6 +1736,17 @@ impl AppState {
 // ---------------------------------------------------------------------------
 
 impl eframe::App for AppState {
+    /// Flush anything the 500 ms index debounce is still holding. Without this,
+    /// closing the app within half a second of a state change loses it.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Hand the clients their own titles back. They outlive RM, so a rename
+        // left behind sticks until the user restarts the client.
+        self.restore_roblox_window_titles();
+        if self.asset_index_dirty {
+            self.save_asset_index();
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame_count += 1;
         // Schedule a repaint so background timers below tick even when the
@@ -851,73 +1777,191 @@ impl eframe::App for AppState {
             }
         }
 
-        // Periodically refresh roblox_running flag (every ~120 frames ≈ 2s)
-        if self.frame_count.is_multiple_of(120) {
-            self.roblox_running = ram_core::process::is_roblox_running();
+        // Reconcile the PID-to-account map, and with it `roblox_running` and
+        // the instance count. Every 2 seconds of wall clock, not every 120
+        // frames: the frame rate swings by two orders of magnitude between
+        // idle and animating, so a frame counter is not a clock. Process
+        // enumeration happens on the backend thread.
+        // The user just unticked "name Roblox windows". Undo what we did rather
+        // than abandoning the clients under RM's labels.
+        if self.renaming_was_enabled && !self.config.rename_roblox_windows {
+            self.restore_roblox_window_titles();
+        }
+        self.renaming_was_enabled = self.config.rename_roblox_windows;
+
+        // Sweep hard for a while after a launch, idle the rest of the time. A
+        // client takes a few seconds to appear and the 2 second cadence sat on
+        // top of that, so naming it visibly lagged the window opening. Outside
+        // that window nobody is waiting, and each sweep costs a ReadProcessMemory
+        // against every client, so the slow cadence is the one to default to.
+        let sweep_every = match self.last_launch_request {
+            Some(t) if t.elapsed() < Duration::from_secs(30) => Duration::from_millis(400),
+            _ => Duration::from_secs(2),
+        };
+        if interval_due(&mut self.last_instance_sweep, sweep_every) {
+            self.bridge.send(BackendCommand::SweepInstances);
         }
 
         // Periodically kill background tray Roblox processes when enabled.
         // Uses wall-clock time so the cadence is reliable in reactive mode
         // (the frame counter approach we used before only fired when the
         // user happened to interact 600 times).
-        if self.config.kill_background_roblox || self.config.multi_instance_enabled {
-            let now = std::time::Instant::now();
-            let due = self
-                .last_tray_kill
-                .map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_secs(10));
-            if due {
-                self.last_tray_kill = Some(now);
-                ram_core::process::kill_tray_roblox();
-            }
+        if (self.config.kill_background_roblox || self.config.multi_instance_enabled)
+            && interval_due(&mut self.last_tray_kill, Duration::from_secs(10))
+        {
+            ram_core::process::kill_tray_roblox();
         }
 
-        // Periodically refresh presence for visible accounts (every ~600 frames ≈ 10s)
-        if self.frame_count.is_multiple_of(600) && !self.visible_user_ids.is_empty() {
+        // Periodically refresh presence for visible accounts (every 10s)
+        if !self.visible_user_ids.is_empty()
+            && interval_due(&mut self.last_presence_poll, Duration::from_secs(10))
+        {
             self.trigger_presence_refresh();
         }
 
-        // Periodically refresh avatars for all accounts (every ~3600 frames ≈ 60s)
-        if self.frame_count % 3600 == 300 && !self.store.accounts.is_empty() {
+        // Periodically refresh avatars for all accounts (every 60s)
+        if !self.store.accounts.is_empty()
+            && interval_due(&mut self.last_avatar_refresh, Duration::from_secs(60))
+        {
             self.trigger_refresh();
         }
 
-        // Periodically revalidate all account cookies (every ~18000 frames ≈ 5 min)
-        if self.frame_count % 18000 == 900 && !self.store.accounts.is_empty() {
+        // Periodically revalidate all account cookies (every 5 min). This is
+        // also the path that clears `cookie_expired` once a cookie starts
+        // working again, which is what lets the refresh timers above pick an
+        // account back up, so it must keep ticking while the app sits idle.
+        if !self.store.accounts.is_empty()
+            && interval_due(&mut self.last_revalidation, Duration::from_secs(300))
+        {
             self.trigger_revalidation();
+        }
+
+        // Poll uploads still in moderation. Not gated on the active tab: a
+        // result must land whether or not the user is looking at the Asset
+        // Manager. The interval widens as the oldest upload ages, and the timer
+        // stops entirely once nothing is pending, so an idle app makes no asset
+        // requests at all.
+        if !self.needs_unlock && self.asset_index.pending().next().is_some() {
+            // Computed before the call: `interval_due` takes &mut self.
+            let every = self.asset_poll_interval();
+            if interval_due(&mut self.last_asset_poll, every) {
+                self.dispatch_asset_poll();
+            }
+        }
+
+        // Same shape for moderation, on its own slower clock. Separate rather
+        // than folded into the above because the two wait on different things:
+        // an operation finishes in seconds, a review can take days, and one
+        // timer would have to run at the faster of the two rates.
+        if !self.needs_unlock && self.asset_index.in_review().next().is_some() {
+            let every = self.moderation_poll_interval();
+            if interval_due(&mut self.last_moderation_poll, every) {
+                self.dispatch_moderation_poll();
+            }
+        }
+
+        // Re-send anything whose retry backoff or audio spacing has come due.
+        // Cheap: a scan of the index, and only while something is queued.
+        if !self.needs_unlock
+            && self
+                .asset_index
+                .records
+                .iter()
+                .any(|r| matches!(r.state, AssetState::Queued))
+            && interval_due(&mut self.last_upload_pump, Duration::from_secs(1))
+        {
+            self.dispatch_next_uploads();
+        }
+
+        // Flush index changes that the debounce has been holding.
+        if self.asset_index_dirty
+            && interval_due(&mut self.last_asset_index_save, Duration::from_millis(500))
+        {
+            self.save_asset_index();
         }
 
         // ---- Unlock screen ----
         if self.needs_unlock {
+            let mut submit = false;
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
-                    ui.heading("🔒 RM | Unlock Account Store");
-                    ui.add_space(16.0);
-                    ui.label("Enter your master password to decrypt accounts:");
-                    ui.add_space(8.0);
 
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.unlock_password_input)
-                            .password(true)
-                            .hint_text("Master password"),
-                    );
+                    if self.device_key_missing {
+                        // No password exists for this store, so offering a
+                        // password box would be a dead end. Say what happened.
+                        ui.heading("🔒 RM | Cannot Unlock On This PC");
+                        ui.add_space(16.0);
+                        ui.label(
+                            "This account store unlocks automatically, but the key for it is \
+                             missing from this PC's credential store.",
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "That usually means the store was copied from another PC, or \
+                                 Windows credentials were reset.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    } else if self.unlocking {
+                        ui.heading("🔒 RM | Unlocking");
+                        ui.add_space(16.0);
+                        ui.spinner();
+                    } else {
+                        ui.heading("🔒 RM | Unlock Account Store");
+                        ui.add_space(16.0);
+                        ui.label("Enter your master password to decrypt accounts:");
+                        ui.add_space(8.0);
 
-                    ui.add_space(8.0);
-                    let enter_pressed =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.unlock_password_input)
+                                .password(true)
+                                .hint_text("Master password"),
+                        );
 
-                    if ui.button("Unlock").clicked() || enter_pressed {
-                        let pw = self.unlock_password_input.clone();
-                        self.master_password = pw.clone();
-                        self.bridge.send(BackendCommand::LoadStore {
-                            path: self.config.accounts_path.clone(),
-                            password: pw,
-                        });
+                        ui.add_space(8.0);
+                        let enter_pressed = response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.button("Unlock").clicked() || enter_pressed {
+                            submit = true;
+                        }
+                    }
+
+                    ui.add_space(6.0);
+                    let link = if self.device_key_missing {
+                        "Recovery options"
+                    } else {
+                        "Forgot password?"
+                    };
+                    if ui.link(egui::RichText::new(link).weak().small()).clicked() {
+                        self.show_recovery = true;
                     }
                 });
             });
+
+            if submit {
+                let pw = self.unlock_password_input.clone();
+                // Held only until the store opens: a legacy store is re-encrypted
+                // under it, and it is cleared as soon as that finishes.
+                self.unlock_password_used = pw.clone();
+                self.unlocking = true;
+                self.bridge.send(BackendCommand::UnlockWithPassword {
+                    path: self.config.accounts_path.clone(),
+                    password: pw,
+                });
+            }
+
+            self.show_recovery_dialog(ctx);
             self.toasts.show(ctx);
             return;
+        }
+
+        // Turning Developer options off must not strand the user on a tab that
+        // is no longer in the bar.
+        if !self.config.developer_options && self.active_tab == Tab::AssetManager {
+            self.active_tab = Tab::Accounts;
         }
 
         // ---- Top bar ----
@@ -926,6 +1970,13 @@ impl eframe::App for AppState {
                 ui.selectable_value(&mut self.active_tab, Tab::Accounts, "📋 Accounts");
                 ui.selectable_value(&mut self.active_tab, Tab::PrivateServers, "🔒 Private Servers");
                 ui.selectable_value(&mut self.active_tab, Tab::Presets, "⭐ Presets");
+                if self.config.developer_options {
+                    ui.selectable_value(
+                        &mut self.active_tab,
+                        Tab::AssetManager,
+                        "\u{1f4e6} Asset Manager",
+                    );
+                }
                 ui.selectable_value(&mut self.active_tab, Tab::Settings, "⚙ Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some((ref version, ref url)) = self.update_available {
@@ -948,16 +1999,17 @@ impl eframe::App for AppState {
                         self.trigger_refresh();
                     }
                     if self.roblox_running {
-                        let count = ram_core::process::roblox_instance_count();
+                        let count = self.roblox_instance_count;
                         ui.colored_label(
-                            egui::Color32::from_rgb(30, 144, 255),
+                            ui.theme().info,
                             format!("● {count} Roblox instance{}", if count == 1 { "" } else { "s" }),
-                        );
+                        )
+                        .on_hover_text(self.instance_attribution_summary());
                         ui.separator();
                     }
                     if self.selected_ids.len() > 1 {
                         ui.colored_label(
-                            egui::Color32::from_rgb(130, 180, 255),
+                            ui.theme().accent_text,
                             format!("{} selected", self.selected_ids.len()),
                         );
                         ui.separator();
@@ -972,6 +2024,7 @@ impl eframe::App for AppState {
             Tab::Accounts => self.show_accounts_tab(ctx),
             Tab::PrivateServers => self.show_private_servers_tab(ctx),
             Tab::Presets => self.show_presets_tab(ctx),
+            Tab::AssetManager => self.show_asset_manager_tab(ctx),
             Tab::Settings => self.show_settings_tab(ctx),
         }
 
@@ -981,8 +2034,17 @@ impl eframe::App for AppState {
         // ---- Confirmation dialog for account removal ----
         self.show_confirm_remove_dialog(ctx);
 
+        // ---- Confirmation before an asset upload batch ----
+        self.show_upload_confirm_dialog(ctx);
+
+        // ---- Grant universe access to selected assets ----
+        self.show_grant_dialog(ctx);
+
         // ---- Changelog window ----
         self.show_changelog_window(ctx);
+
+        // ---- One-time offer to stop requiring a master password ----
+        self.show_passwordless_offer_dialog(ctx);
 
         // ---- First-launch tutorial overlay ----
         tutorial::show_overlay(ctx, &mut self.tutorial);
@@ -1017,6 +2079,7 @@ impl AppState {
                     self.config.anonymize_names,
                     &self.config.groups,
                     avatars,
+                    &self.tracked_instances,
                 );
                 self.visible_user_ids = result.visible_user_ids;
                 self.tutorial.add_btn_rect = result.add_btn_rect;
@@ -1053,7 +2116,6 @@ impl AppState {
                             self.add_dialog.browser_login_rx = None;
                             self.add_dialog.rejected_cookie = None;
                             self.add_dialog.pending_moderated = None;
-                            self.add_dialog.password_input = self.master_password.clone();
                             self.tutorial.advance_from(tutorial::TutorialStep::AddAccount);
                         }
                         sidebar::SidebarAction::CopyJobId(job_id) => {
@@ -1062,6 +2124,18 @@ impl AppState {
                         }
                         sidebar::SidebarAction::OpenBrowserAs(user_id) => {
                             self.open_browser_as(user_id);
+                        }
+                        sidebar::SidebarAction::FocusInstance(pid) => {
+                            self.focus_instance(pid);
+                        }
+                        sidebar::SidebarAction::KillInstance(pid) => {
+                            self.kill_instance(pid);
+                        }
+                        sidebar::SidebarAction::JoinAccountServer {
+                            user_id,
+                            target_user_id,
+                        } => {
+                            self.join_account_server(user_id, target_user_id);
                         }
                         sidebar::SidebarAction::QuickLaunch(user_id) => {
                             // Prefer the first saved preset (with its Job ID
@@ -1092,12 +2166,14 @@ impl AppState {
                                     .store
                                     .find_by_id(user_id)
                                     .map(|a| (a.user_id, a.encrypted_cookie.clone()));
-                                if let Some((uid, enc)) = acc_lookup {
+                                if let (Some((uid, enc)), Some(session)) =
+                                    (acc_lookup, self.session())
+                                {
                                     if self.try_consume_launch_slot() {
-                                        self.bridge.send(BackendCommand::LaunchGameEncrypted {
+                                        self.bridge.send(BackendCommand::LaunchGame {
                                             user_id: uid,
                                             encrypted_cookie: enc,
-                                            password: self.master_password.clone(),
+                                            session: session.clone(),
                                             use_credential_manager: self.config.use_credential_manager,
                                             place_id,
                                             job_id,
@@ -1281,19 +2357,21 @@ impl AppState {
                                 .filter(|a| self.selected_ids.contains(&a.user_id))
                                 .map(|a| (a.user_id, a.encrypted_cookie.clone()))
                                 .collect();
-                            self.bridge.send(BackendCommand::BulkLaunchEncrypted {
-                                accounts,
-                                password: self.master_password.clone(),
-                                use_credential_manager: self.config.use_credential_manager,
-                                place_id,
-                                job_id,
-                                link_code: None,
-                                access_code: None,
-                                multi_instance: self.config.multi_instance_enabled,
-                                kill_background: self.config.kill_background_roblox,
-                                privacy_mode: self.config.privacy_mode,
-                                launch_delay_secs: self.config.launch_delay_secs,
-                            });
+                            if let Some(session) = self.session() {
+                                self.bridge.send(BackendCommand::BulkLaunchEncrypted {
+                                    accounts,
+                                    session,
+                                    use_credential_manager: self.config.use_credential_manager,
+                                    place_id,
+                                    job_id,
+                                    link_code: None,
+                                    access_code: None,
+                                    multi_instance: self.config.multi_instance_enabled,
+                                    kill_background: self.config.kill_background_roblox,
+                                    privacy_mode: self.config.privacy_mode,
+                                    launch_delay_secs: self.config.launch_delay_secs,
+                                });
+                            }
                         }
                         group_panel::GroupPanelAction::ClearSelection => {
                             self.selected_ids.clear();
@@ -1327,11 +2405,16 @@ impl AppState {
                     if let Some(a) = result.action {
                         match a {
                             main_panel::MainPanelAction::LaunchGame { place_id, job_id } => {
-                                if self.try_consume_launch_slot() {
-                                    self.bridge.send(BackendCommand::LaunchGameEncrypted {
+                                // Session first, so a locked store does not
+                                // spend the launch-delay slot on a launch that
+                                // cannot happen.
+                                let ready =
+                                    self.session().filter(|_| self.try_consume_launch_slot());
+                                if let Some(session) = ready {
+                                    self.bridge.send(BackendCommand::LaunchGame {
                                         user_id: account.user_id,
                                         encrypted_cookie: account.encrypted_cookie.clone(),
-                                        password: self.master_password.clone(),
+                                        session,
                                         use_credential_manager: self.config.use_credential_manager,
                                         place_id,
                                         job_id,
@@ -1457,22 +2540,26 @@ impl AppState {
                                 .store
                                 .find_by_id(uid)
                                 .map(|a| (a.user_id, a.encrypted_cookie.clone()));
-                            if let Some((user_id, enc)) = acc_lookup {
-                                if self.try_consume_launch_slot() {
-                                    self.bridge.send(BackendCommand::LaunchGameEncrypted {
-                                        user_id,
-                                        encrypted_cookie: enc,
-                                        password: self.master_password.clone(),
-                                        use_credential_manager: self.config.use_credential_manager,
-                                        place_id,
-                                        job_id: None,
-                                        link_code: Some(link_code.clone()),
-                                        access_code: ac.clone(),
-                                        multi_instance: self.config.multi_instance_enabled,
-                                        kill_background: self.config.kill_background_roblox,
-                                        privacy_mode: self.config.privacy_mode,
-                                    });
-                                }
+                            // Session first, so a locked store does not spend
+                            // the launch-delay slot on a launch that cannot
+                            // happen.
+                            let ready = self
+                                .session()
+                                .filter(|_| self.try_consume_launch_slot());
+                            if let (Some((user_id, enc)), Some(session)) = (acc_lookup, ready) {
+                                self.bridge.send(BackendCommand::LaunchGame {
+                                    user_id,
+                                    encrypted_cookie: enc,
+                                    session,
+                                    use_credential_manager: self.config.use_credential_manager,
+                                    place_id,
+                                    job_id: None,
+                                    link_code: Some(link_code.clone()),
+                                    access_code: ac.clone(),
+                                    multi_instance: self.config.multi_instance_enabled,
+                                    kill_background: self.config.kill_background_roblox,
+                                    privacy_mode: self.config.privacy_mode,
+                                });
                             }
                         } else if self.selected_ids.len() > 1 {
                             let accounts: Vec<(u64, Option<String>)> = self
@@ -1482,19 +2569,21 @@ impl AppState {
                                 .filter(|a| self.selected_ids.contains(&a.user_id))
                                 .map(|a| (a.user_id, a.encrypted_cookie.clone()))
                                 .collect();
-                            self.bridge.send(BackendCommand::BulkLaunchEncrypted {
-                                accounts,
-                                password: self.master_password.clone(),
-                                use_credential_manager: self.config.use_credential_manager,
-                                place_id,
-                                job_id: None,
-                                link_code: Some(link_code),
-                                access_code: ac,
-                                multi_instance: self.config.multi_instance_enabled,
-                                kill_background: self.config.kill_background_roblox,
-                                privacy_mode: self.config.privacy_mode,
-                                launch_delay_secs: self.config.launch_delay_secs,
-                            });
+                            if let Some(session) = self.session() {
+                                self.bridge.send(BackendCommand::BulkLaunchEncrypted {
+                                    accounts,
+                                    session,
+                                    use_credential_manager: self.config.use_credential_manager,
+                                    place_id,
+                                    job_id: None,
+                                    link_code: Some(link_code),
+                                    access_code: ac,
+                                    multi_instance: self.config.multi_instance_enabled,
+                                    kill_background: self.config.kill_background_roblox,
+                                    privacy_mode: self.config.privacy_mode,
+                                    launch_delay_secs: self.config.launch_delay_secs,
+                                });
+                            }
                         }
                     }
                     private_servers::PrivateServerAction::Resolve(idx) => {
@@ -1511,13 +2600,18 @@ impl AppState {
                         server_name,
                     } => {
                         // Need an authenticated account to resolve share links
-                        if let Some(acc) = self.store.accounts.first() {
+                        let acc = self
+                            .store
+                            .accounts
+                            .first()
+                            .map(|a| (a.user_id, a.encrypted_cookie.clone()));
+                        if let (Some((first_user_id, enc)), Some(session)) = (acc, self.session()) {
                             self.bridge.send(BackendCommand::ResolveShareLink {
                                 share_code,
                                 server_name,
-                                first_user_id: acc.user_id,
-                                encrypted_cookie: acc.encrypted_cookie.clone(),
-                                password: self.master_password.clone(),
+                                first_user_id,
+                                encrypted_cookie: enc,
+                                session,
                                 use_credential_manager: self.config.use_credential_manager,
                             });
                             self.toasts.push(Toast::info("Resolving share link..."));
@@ -1588,9 +2682,1093 @@ impl AppState {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Asset manager
+    // ------------------------------------------------------------------
+
+    /// Most uploads Roblox will accept at once. The spec calls 4 comfortable
+    /// and throttles above ~8, but this app shares one client, one connection
+    /// pool and one IP with the presence, avatar and revalidation timers, so
+    /// leave headroom.
+    const MAX_CONCURRENT_UPLOADS: usize = 3;
+
+    /// Audio uploads run one at a time.
+    ///
+    /// Audio is the only kind with a per-account quota on top of the ordinary
+    /// rate limit, and it is by a wide margin the slowest to ingest. Sending
+    /// three at once is what made a bulk audio import collapse into a column of
+    /// failures while the same files uploaded one by one without complaint.
+    const MAX_CONCURRENT_AUDIO_UPLOADS: usize = 1;
+
+    /// Minimum gap between starting two audio uploads. Serialising them is not
+    /// enough on its own: back-to-back sends still trip the limiter, and its
+    /// window is measured in seconds, not milliseconds.
+    const AUDIO_UPLOAD_SPACING: Duration = Duration::from_secs(3);
+
+    /// Largest poll batch per tick. Bounded so a big backlog becomes a steady
+    /// trickle instead of one enormous burst.
+    const MAX_POLL_BATCH: usize = 25;
+
+    /// Reconcile the index with reality after a restart.
+    ///
+    /// A row left in `Uploading` means the app died between sending the command
+    /// and hearing back, so no operation was ever confirmed. It goes back to
+    /// `Queued`; the dedupe check runs again before anything is re-sent, which
+    /// is what stops a crash from producing a duplicate asset. Rows in
+    /// `Pending` keep their operation ID and simply resume polling.
+    fn recover_asset_index(&mut self) {
+        // Collected first so the duplicate lookup can borrow the index
+        // immutably before anything is mutated.
+        let interrupted: Vec<(String, String, ram_core::assets::Creator)> = self
+            .asset_index
+            .records
+            .iter()
+            .filter(|r| matches!(r.state, AssetState::Uploading))
+            .map(|r| (r.row_id.clone(), r.file_sha256.clone(), r.creator))
+            .collect();
+
+        let changed = !interrupted.is_empty();
+        for (row_id, sha256, creator) in interrupted {
+            // If the previous run got far enough to hash the file and the same
+            // bytes are already live under this creator, the upload evidently
+            // succeeded. Re-sending would mint a second permanent asset.
+            let existing = self
+                .asset_index
+                .find_uploaded(&sha256, creator)
+                .and_then(|r| r.state.asset_id());
+            if let Some(record) = self.asset_index.get_mut(&row_id) {
+                record.state = match existing {
+                    Some(asset_id) => AssetState::Duplicate { asset_id },
+                    None => AssetState::Queued,
+                };
+            }
+        }
+        let expired =
+            ram_core::assets::expire_stale_operations(&mut self.asset_index, chrono::Utc::now());
+        if changed || !expired.is_empty() {
+            self.save_asset_index();
+        }
+    }
+
+    /// Write the index now, unless the file on disk is one we must not touch.
+    fn save_asset_index(&mut self) {
+        self.asset_index_dirty = false;
+        self.last_asset_index_save = Some(std::time::Instant::now());
+        if self.asset_index_read_only {
+            return;
+        }
+        if let Err(e) = self.asset_index.save(&self.asset_index_path) {
+            tracing::error!("failed to save asset index: {e}");
+        }
+    }
+
+    /// Fill free upload slots from the queue, oldest first.
+    ///
+    /// Called on every asset event and on the frame timer, so a row whose
+    /// retry or audio spacing has not come due yet is simply skipped and picked
+    /// up by a later call.
+    fn dispatch_next_uploads(&mut self) {
+        if self.needs_unlock {
+            return;
+        }
+        let in_flight = self
+            .asset_index
+            .records
+            .iter()
+            .filter(|r| matches!(r.state, AssetState::Uploading))
+            .count();
+
+        for _ in in_flight..Self::MAX_CONCURRENT_UPLOADS {
+            let Some(job) = self.take_next_upload() else {
+                break;
+            };
+            if job.kind == AssetKind::Audio {
+                self.last_audio_upload = Some(Instant::now());
+            }
+            self.bridge.send(BackendCommand::UploadAsset(Box::new(job)));
+        }
+    }
+
+    /// Whether another audio upload may start right now.
+    fn audio_slot_free(&self) -> bool {
+        let audio_in_flight = self
+            .asset_index
+            .records
+            .iter()
+            .filter(|r| matches!(r.state, AssetState::Uploading) && r.kind == AssetKind::Audio)
+            .count();
+        if audio_in_flight >= Self::MAX_CONCURRENT_AUDIO_UPLOADS {
+            return false;
+        }
+        self.last_audio_upload
+            .is_none_or(|last| last.elapsed() >= Self::AUDIO_UPLOAD_SPACING)
+    }
+
+    /// Claim the next queued row and build its job, marking it `Uploading` so
+    /// the next call cannot claim it again.
+    ///
+    /// Loops rather than returning on the first duplicate: a queue whose head
+    /// is all duplicates would otherwise stall with real work behind it.
+    fn take_next_upload(&mut self) -> Option<UploadJob> {
+        let now = chrono::Utc::now();
+        let audio_ok = self.audio_slot_free();
+        loop {
+            // The loop always makes progress: the only path that continues has
+            // just moved its row out of `Queued`, so it cannot be picked again.
+            let row_id = self
+                .asset_index
+                .records
+                .iter()
+                .filter(|r| matches!(r.state, AssetState::Queued))
+                // A row waiting out its retry backoff is not ready yet.
+                .filter(|r| r.retry_at.is_none_or(|at| now >= at))
+                .find(|r| audio_ok || r.kind != AssetKind::Audio)
+                .map(|r| r.row_id.clone())?;
+
+            let record = self.asset_index.get(&row_id)?;
+
+            // A retry of a row that was already hashed and already landed must
+            // not upload again. Assets are permanent and audio burns a
+            // per-account quota, so the check is worth the linear scan.
+            if let Some(asset_id) = self
+                .asset_index
+                .find_uploaded(&record.file_sha256, record.creator)
+                .and_then(|r| r.state.asset_id())
+            {
+                if let Some(record) = self.asset_index.get_mut(&row_id) {
+                    record.state = AssetState::Duplicate { asset_id };
+                }
+                self.asset_index_dirty = true;
+                continue;
+            }
+
+            return self.build_upload_job(&row_id);
+        }
+    }
+
+    fn build_upload_job(&mut self, row_id: &str) -> Option<UploadJob> {
+        let session = self.session()?;
+        let row_id = row_id.to_string();
+        let record = self.asset_index.get(&row_id)?;
+        let uploader = record.uploaded_by;
+        let account = self.store.find_by_id(uploader)?;
+        let encrypted_cookie = account.encrypted_cookie.clone();
+
+        let job = UploadJob {
+            row_id: row_id.clone(),
+            user_id: uploader,
+            encrypted_cookie,
+            session: session.clone(),
+            use_credential_manager: self.config.use_credential_manager,
+            creator: record.creator,
+            kind: record.kind,
+            display_name: record.display_name.clone(),
+            description: record.description.clone(),
+            file_path: record.file_path.clone(),
+        };
+
+        if let Some(record) = self.asset_index.get_mut(&row_id) {
+            record.state = AssetState::Uploading;
+            record.attempts = record.attempts.saturating_add(1);
+            record.retry_at = None;
+        }
+        self.asset_index_dirty = true;
+        Some(job)
+    }
+
+    /// Ask about everything currently in moderation, grouped by account so one
+    /// cookie decrypt covers a whole batch.
+    fn dispatch_asset_poll(&mut self) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let expired = ram_core::assets::expire_stale_operations(&mut self.asset_index, now);
+        if !expired.is_empty() {
+            self.save_asset_index();
+        }
+
+        let batch =
+            ram_core::assets::next_poll_batch(&self.asset_index.records, now, Self::MAX_POLL_BATCH);
+        if batch.is_empty() {
+            return;
+        }
+
+        // Group by uploader. Polling per row would decrypt the same cookie
+        // dozens of times and fan out into as many concurrent tasks.
+        let mut by_account: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        for (row_id, operation) in batch {
+            let Some(record) = self.asset_index.get(&row_id) else {
+                continue;
+            };
+            by_account
+                .entry(record.uploaded_by)
+                .or_default()
+                .push((row_id, operation));
+        }
+
+        for (user_id, operations) in by_account {
+            let Some(account) = self.store.find_by_id(user_id) else {
+                continue;
+            };
+            self.bridge.send(BackendCommand::PollAssetOperations {
+                user_id,
+                encrypted_cookie: account.encrypted_cookie.clone(),
+                session: session.clone(),
+                use_credential_manager: self.config.use_credential_manager,
+                operations,
+            });
+        }
+    }
+
+    /// Ask moderation about everything that has an asset id but no verdict.
+    ///
+    /// Grouped by uploader for the same reason operation polling is: one cookie
+    /// decrypt per account rather than one per row.
+    fn dispatch_moderation_poll(&mut self) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let batch = ram_core::assets::next_review_batch(
+            &self.asset_index.records,
+            now,
+            Self::MAX_POLL_BATCH,
+        );
+        if batch.is_empty() {
+            return;
+        }
+
+        let mut by_account: HashMap<u64, Vec<(String, u64)>> = HashMap::new();
+        for (row_id, asset_id) in batch {
+            let Some(record) = self.asset_index.get(&row_id) else {
+                continue;
+            };
+            by_account
+                .entry(record.uploaded_by)
+                .or_default()
+                .push((row_id, asset_id));
+        }
+
+        for (user_id, assets) in by_account {
+            let Some(account) = self.store.find_by_id(user_id) else {
+                continue;
+            };
+            self.bridge.send(BackendCommand::PollAssetModeration {
+                user_id,
+                encrypted_cookie: account.encrypted_cookie.clone(),
+                session: session.clone(),
+                use_credential_manager: self.config.use_credential_manager,
+                assets,
+            });
+        }
+    }
+
+    /// How long until the next poll, from the age of the oldest pending upload.
+    fn asset_poll_interval(&self) -> Duration {
+        let now = chrono::Utc::now();
+        let oldest = self
+            .asset_index
+            .pending()
+            .filter_map(|r| match &r.state {
+                AssetState::Pending { since, .. } => Some(*since),
+                _ => None,
+            })
+            .min();
+        let age = oldest
+            .map(|since| now.signed_duration_since(since))
+            .and_then(|d| d.to_std().ok())
+            .unwrap_or_default();
+        ram_core::assets::poll_interval_for_age(age)
+    }
+
+    /// How long until the next moderation poll, from the age of the oldest
+    /// asset still in review.
+    fn moderation_poll_interval(&self) -> Duration {
+        let now = chrono::Utc::now();
+        let oldest = self
+            .asset_index
+            .in_review()
+            .filter_map(|r| match &r.state {
+                AssetState::InReview { since, .. } => Some(*since),
+                _ => None,
+            })
+            .min();
+        let age = oldest
+            .map(|since| now.signed_duration_since(since))
+            .and_then(|d| d.to_std().ok())
+            .unwrap_or_default();
+        ram_core::assets::review_poll_interval_for_age(age)
+    }
+
+    /// Largest thumbnail batch per request. Roblox accepts long ID lists, but
+    /// a bounded batch keeps one screenful of a grid to a single call.
+    const MAX_THUMBNAIL_BATCH: usize = 50;
+
+    /// How long to wait before asking again for a thumbnail Roblox has not
+    /// rendered. Long enough not to hammer, short enough that an asset fills in
+    /// while the user is still looking at the same screen.
+    const THUMBNAIL_RETRY: Duration = Duration::from_secs(20);
+
+    /// Fetch thumbnails for assets that have none cached yet.
+    ///
+    /// Requests are remembered, not just results: without that, an asset whose
+    /// thumbnail Roblox has not rendered (it answers `Pending`) would be
+    /// re-requested on every single frame.
+    fn request_asset_thumbnails(&mut self, wanted: &[u64]) {
+        let now = std::time::Instant::now();
+        let missing: Vec<u64> = wanted
+            .iter()
+            .copied()
+            .filter(|id| !self.asset_thumbnails.contains_key(id))
+            .filter(|id| !self.asset_thumbnails_inflight.contains(id))
+            .filter(|id| {
+                self.asset_thumbnails_retry_at
+                    .get(id)
+                    .is_none_or(|retry_at| now >= *retry_at)
+            })
+            .take(Self::MAX_THUMBNAIL_BATCH)
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        self.asset_thumbnails_inflight.extend(missing.iter());
+        self.bridge
+            .send(BackendCommand::FetchAssetThumbnails { asset_ids: missing });
+    }
+
+    /// Request one page of a creator's inventory.
+    fn fetch_creations(
+        &mut self,
+        node: asset_manager::TreeNode,
+        kind: ram_core::assets::AssetKind,
+        cursor: Option<String>,
+    ) {
+        let asset_manager::TreeNode::Inventory(creator) = node else {
+            return;
+        };
+        let Some(session) = self.session() else {
+            return;
+        };
+        let Some(user_id) = self.asset_manager_state.acting_user_id else {
+            return;
+        };
+        let Some(account) = self.store.find_by_id(user_id) else {
+            return;
+        };
+        self.bridge.send(BackendCommand::FetchCreations {
+            user_id,
+            encrypted_cookie: account.encrypted_cookie.clone(),
+            session: session.clone(),
+            use_credential_manager: self.config.use_credential_manager,
+            creator,
+            kind,
+            cursor,
+        });
+    }
+
+    /// Refresh the universe picker for the acting account, and optionally
+    /// resolve a pasted place ID at the same time (one cookie decrypt covers
+    /// both).
+    fn fetch_universe_targets(&mut self, place_id: Option<u64>) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let Some(user_id) = self.asset_manager_state.acting_user_id else {
+            return;
+        };
+        let Some(account) = self.store.find_by_id(user_id) else {
+            return;
+        };
+        self.bridge.send(BackendCommand::FetchUniverseTargets {
+            user_id,
+            encrypted_cookie: account.encrypted_cookie.clone(),
+            session: session.clone(),
+            use_credential_manager: self.config.use_credential_manager,
+            place_id,
+        });
+    }
+
+    /// Grant a universe `Use` on the given selection keys.
+    ///
+    /// The selection spans two key spaces, because the library and the
+    /// inventory share one set: a library key is a local `row_id`, an inventory
+    /// key is the asset ID of something already on Roblox. Resolving only the
+    /// first meant a selection made in the inventory came out empty and
+    /// reported itself as an unfinished upload.
+    ///
+    /// Local rows with no asset ID yet are genuinely skipped: there is nothing
+    /// on Roblox to grant against.
+    fn grant_universe_access(&mut self, universe_id: u64, keys: Vec<String>) {
+        let Some(session) = self.session() else {
+            return;
+        };
+        let mut asset_ids = Vec::new();
+        let mut row_assets = Vec::new();
+        let mut uploader = None;
+        let mut unfinished = 0usize;
+
+        for key in keys {
+            match self.asset_index.get(&key) {
+                Some(record) => match record.state.asset_id() {
+                    Some(asset_id) => {
+                        // A local row knows which account uploaded it, which
+                        // for a group upload is not the acting account.
+                        uploader.get_or_insert(record.uploaded_by);
+                        asset_ids.push(asset_id);
+                        row_assets.push((key, asset_id));
+                    }
+                    None => unfinished += 1,
+                },
+                // Not a local row, so it came from the inventory and the key is
+                // the asset ID itself. `row_id` is a UUID, so the two key
+                // spaces cannot collide.
+                None => match key.parse::<u64>() {
+                    Ok(asset_id) => asset_ids.push(asset_id),
+                    Err(_) => continue,
+                },
+            }
+        }
+
+        if asset_ids.is_empty() {
+            // Two different failures, and telling them apart is the whole point
+            // of the message.
+            self.toasts.push(Toast::info(if unfinished > 0 {
+                "Nothing to grant. Those assets have not finished uploading."
+            } else {
+                "Nothing to grant. Select some assets first."
+            }));
+            return;
+        }
+
+        // Inventory assets have no uploader on record, so the grant is signed
+        // by whichever account is browsing. That is the account whose rights
+        // put the asset on screen in the first place.
+        let uploader = uploader.or(self.asset_manager_state.acting_user_id);
+        let Some(user_id) = uploader else {
+            self.toasts
+                .push(Toast::error("No account selected to sign the grant."));
+            return;
+        };
+        let Some(account) = self.store.find_by_id(user_id) else {
+            return;
+        };
+        self.bridge.send(BackendCommand::GrantAssetPermissions {
+            user_id,
+            encrypted_cookie: account.encrypted_cookie.clone(),
+            session: session.clone(),
+            use_credential_manager: self.config.use_credential_manager,
+            universe_id,
+            asset_ids,
+            row_assets,
+        });
+    }
+
+    /// The "Grant access to" modal, opened from the library selection footer.
+    fn show_grant_dialog(&mut self, ctx: &egui::Context) {
+        if !self.asset_manager_state.grant_open {
+            return;
+        }
+        let mut open = true;
+        let mut granted: Option<u64> = None;
+        let mut resolve: Option<u64> = None;
+        // Separate from `open`, which the window title bar's close button owns
+        // for the duration of `show`.
+        let mut cancelled = false;
+
+        egui::Window::new("Grant universe access")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let count = self.asset_manager_state.selected.len();
+                ui.label(format!(
+                    "Let one experience use {count} selected asset(s)."
+                ));
+                ui.add_space(8.0);
+
+                ui.label("Experience:");
+                asset_manager::universe_picker(
+                    ui,
+                    "grant_universe_pick",
+                    &self.universe_targets,
+                    &mut self.asset_manager_state.grant_universe,
+                );
+                if self.universe_targets.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "Roblox did not return a list of your experiences. Paste an ID below.",
+                        )
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.label("Or paste a place or universe ID:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.asset_manager_state.grant_manual)
+                            .desired_width(200.0)
+                            .hint_text("ID or roblox.com/games/... link"),
+                    );
+                    let parsed = ram_core::assets::parse_id_input(
+                        &self.asset_manager_state.grant_manual,
+                    );
+                    if ui
+                        .add_enabled(parsed.is_some(), egui::Button::new("Use as universe"))
+                        .clicked()
+                    {
+                        self.asset_manager_state.grant_universe = parsed;
+                    }
+                    if ui
+                        .add_enabled(parsed.is_some(), egui::Button::new("Resolve as place"))
+                        .on_hover_text("Look up which universe this place belongs to")
+                        .clicked()
+                    {
+                        resolve = parsed;
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let target = self.asset_manager_state.grant_universe;
+                    let grant = egui::Button::new(
+                        egui::RichText::new("Grant").color(ui.theme().on_accent),
+                    )
+                    .fill(ui.visuals().selection.bg_fill);
+                    if ui.add_enabled(target.is_some(), grant).clicked() {
+                        granted = target;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if let Some(place_id) = resolve {
+            self.fetch_universe_targets(Some(place_id));
+        }
+        if let Some(universe_id) = granted {
+            let rows: Vec<String> =
+                self.asset_manager_state.selected.iter().cloned().collect();
+            self.grant_universe_access(universe_id, rows);
+            self.asset_manager_state.grant_open = false;
+        } else if cancelled || !open {
+            self.asset_manager_state.grant_open = false;
+        }
+    }
+
+    /// Apply the result of an upload operation.
+    ///
+    /// An approval here means Roblox finished *ingesting* the file, not that
+    /// the asset may be used, so the row lands on `InReview` and waits for a
+    /// moderation verdict. The one exception is an asset type that never needs
+    /// review, and that is decided by the verdict itself rather than guessed at
+    /// from the kind.
+    fn apply_operation_outcome(&mut self, row_id: &str, outcome: OperationOutcome) {
+        let now = chrono::Utc::now();
+        let Some(record) = self.asset_index.get_mut(row_id) else {
+            return;
+        };
+        let name = record.display_name.clone();
+        match outcome {
+            // Nothing changed; the row stays Pending and the timer keeps asking.
+            OperationOutcome::StillPending => return,
+            OperationOutcome::Approved {
+                asset_id,
+                revision_id,
+            } => {
+                record.state = AssetState::InReview {
+                    asset_id,
+                    revision_id,
+                    since: now,
+                };
+                record.updated_at = Some(now);
+                record.retry_at = None;
+                // No toast here. Assets that skip review reach Approved in the
+                // same breath and would toast twice, and for the ones that do
+                // wait, "uploaded" is the claim that was misleading in the
+                // first place. The row shows "In review" with a spinner; the
+                // toast belongs to the verdict.
+            }
+            OperationOutcome::Rejected { reason } => {
+                record.state = AssetState::Rejected {
+                    reason: reason.clone(),
+                };
+                record.updated_at = Some(now);
+                self.toasts
+                    .push(Toast::error(format!("{name} was rejected: {reason}")));
+            }
+            OperationOutcome::Failed { message, retryable } => {
+                // Deliberately not routed through `fail_upload`: that re-sends
+                // the file, and by the time an operation exists Roblox may
+                // already hold the asset. `DEADLINE_EXCEEDED` in particular
+                // means "no answer", not "nothing happened", and a silent
+                // re-send there mints a duplicate and burns another slice of
+                // the audio quota. The user gets a Retry button instead.
+                record.state = AssetState::Failed {
+                    message: message.clone(),
+                    retryable,
+                };
+                record.updated_at = Some(now);
+                self.toasts
+                    .push(Toast::error(format!("{name} failed: {message}")));
+            }
+        }
+        self.save_asset_index();
+        self.dispatch_next_uploads();
+    }
+
+    /// Apply a moderation verdict to a row that is waiting on one.
+    fn apply_moderation_status(&mut self, row_id: &str, status: ModerationStatus) {
+        let now = chrono::Utc::now();
+        let Some(record) = self.asset_index.get_mut(row_id) else {
+            return;
+        };
+        // Only a row actually in review can take a verdict. Anything else is a
+        // late answer for a row the user has since retried or removed.
+        let AssetState::InReview {
+            asset_id,
+            revision_id,
+            ..
+        } = record.state
+        else {
+            return;
+        };
+        let name = record.display_name.clone();
+
+        match status {
+            // Still waiting. The timer keeps asking.
+            ModerationStatus::InReview => return,
+            ModerationStatus::Approved => {
+                record.state = AssetState::Approved {
+                    asset_id,
+                    revision_id,
+                };
+                record.updated_at = Some(now);
+                let auto_grant = record.auto_grant_universe;
+                self.toasts
+                    .push(Toast::success(format!("{name} approved as {asset_id}")));
+                // Requirement: an asset that clears moderation is granted to
+                // the batch's universe with no further clicks. Deliberately
+                // here and not on upload: granting a universe access to an
+                // asset that moderation later blocks is a grant that silently
+                // does nothing.
+                if let Some(universe_id) = auto_grant {
+                    self.grant_universe_access(universe_id, vec![row_id.to_string()]);
+                }
+            }
+            ModerationStatus::Rejected => {
+                let reason = format!("Moderation blocked asset {asset_id}");
+                record.state = AssetState::Rejected {
+                    reason: reason.clone(),
+                };
+                record.updated_at = Some(now);
+                self.toasts
+                    .push(Toast::error(format!("{name} was rejected: {reason}")));
+            }
+        }
+        self.save_asset_index();
+    }
+
+    /// Record an upload failure, and put the row back in the queue if it is
+    /// worth another attempt.
+    ///
+    /// Only for failures raised before an operation existed, where nothing was
+    /// created on Roblox and re-sending is therefore free of consequence. The
+    /// automatic re-send is the difference between a bulk batch that rides out
+    /// a rate limit and one that leaves a screen of dead rows. Attempts are
+    /// counted on the record, so a row cannot loop: once the budget is spent it
+    /// stays `Failed` and waits for the user.
+    fn fail_upload(&mut self, row_id: &str, message: String, retryable: bool) {
+        let now = chrono::Utc::now();
+        let Some(record) = self.asset_index.get_mut(row_id) else {
+            return;
+        };
+        let name = record.display_name.clone();
+        let attempts = record.attempts;
+
+        if retryable && attempts < ram_core::assets::MAX_UPLOAD_ATTEMPTS {
+            let wait = ram_core::assets::upload_retry_backoff(attempts.saturating_sub(1));
+            record.state = AssetState::Queued;
+            record.retry_at =
+                Some(now + chrono::Duration::from_std(wait).unwrap_or_else(|_| chrono::TimeDelta::seconds(30)));
+            record.updated_at = Some(now);
+            tracing::info!(
+                "upload of {row_id} failed ({message}); attempt {attempts} of {}, retrying in {wait:?}",
+                ram_core::assets::MAX_UPLOAD_ATTEMPTS
+            );
+        } else {
+            record.state = AssetState::Failed {
+                message: message.clone(),
+                retryable,
+            };
+            record.retry_at = None;
+            record.updated_at = Some(now);
+            self.toasts
+                .push(Toast::error(format!("{name} failed: {message}")));
+        }
+
+        self.save_asset_index();
+        self.dispatch_next_uploads();
+    }
+
+    fn show_asset_manager_tab(&mut self, ctx: &egui::Context) {
+        // OS drag and drop. Read once per frame here so the panel stays
+        // ctx-free, matching how every other panel is structured.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+
+        let mut result = asset_manager::AssetManagerResult::default();
+        let mut tree_action = None;
+
+        // The tree only makes sense next to the library. Hiding it in the
+        // queue gives the queue's wide File Path column the room it needs.
+        if self.asset_manager_state.view == asset_manager::View::Library {
+            egui::SidePanel::left("asset_tree")
+                .default_width(200.0)
+                .width_range(150.0..=340.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    let mut cx = asset_manager::AssetsCtx {
+                        state: &mut self.asset_manager_state,
+                        index: &mut self.asset_index,
+                        accounts: &self.store.accounts,
+                        anonymize: self.config.anonymize_names,
+                        universes: &self.universe_targets,
+                        groups: &self.publish_groups,
+                        remote: &self.remote_inventory,
+                        thumbnails: &self.asset_thumbnails,
+                        unlocked: self.store_session.is_some()
+                            || self.config.use_credential_manager,
+                        read_only: self.asset_index_read_only,
+                    };
+                    tree_action = asset_manager::show_tree(ui, &mut cx);
+                });
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let mut cx = asset_manager::AssetsCtx {
+                state: &mut self.asset_manager_state,
+                index: &mut self.asset_index,
+                accounts: &self.store.accounts,
+                anonymize: self.config.anonymize_names,
+                universes: &self.universe_targets,
+                groups: &self.publish_groups,
+                remote: &self.remote_inventory,
+                thumbnails: &self.asset_thumbnails,
+                unlocked: self.store_session.is_some()
+                    || self.config.use_credential_manager,
+                read_only: self.asset_index_read_only,
+            };
+            result = asset_manager::show(ui, &mut cx);
+        });
+        result.action = result.action.or(tree_action);
+
+        // Fetch thumbnails for what was actually drawn. Batched and
+        // request-once, so scrolling a large grid does not re-ask every frame.
+        self.request_asset_thumbnails(&result.want_thumbnails);
+
+        // Populate the universe picker the first time the tab is opened for an
+        // account, so "Grant access to" is not empty when the user reaches it.
+        if !self.needs_unlock
+            && self.asset_manager_state.acting_user_id.is_some()
+            && self.universe_targets_user != self.asset_manager_state.acting_user_id
+        {
+            self.universe_targets_user = self.asset_manager_state.acting_user_id;
+            self.universe_targets.clear();
+            self.publish_groups.clear();
+            self.fetch_universe_targets(None);
+            if let Some(user_id) = self.asset_manager_state.acting_user_id {
+                let enc = self
+                    .store
+                    .find_by_id(user_id)
+                    .map(|a| a.encrypted_cookie.clone());
+                if let (Some(encrypted_cookie), Some(session)) = (enc, self.session()) {
+                    self.bridge.send(BackendCommand::FetchPublishGroups {
+                        user_id,
+                        encrypted_cookie,
+                        session,
+                        use_credential_manager: self.config.use_credential_manager,
+                    });
+                }
+            }
+        }
+
+        if result.index_changed {
+            self.asset_index_dirty = true;
+        }
+        if !dropped.is_empty() {
+            self.asset_manager_state.view = asset_manager::View::ImportQueue;
+            self.stage_files(dropped);
+        }
+
+        // Handled after the central panel closes so `self` can be mutated
+        // freely, per the borrow note on `show_presets_tab`.
+        let Some(action) = result.action else { return };
+        match action {
+            asset_manager::AssetManagerAction::PickFiles => {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter(
+                        "Roblox assets",
+                        &[
+                            "png", "jpg", "jpeg", "bmp", "tga", "mp3", "ogg", "wav", "flac",
+                            "fbx", "gltf", "glb", "rbxm", "rbxmx", "mp4", "mov",
+                        ],
+                    )
+                    .add_filter("All files", &["*"])
+                    .pick_files()
+                {
+                    self.stage_files(paths);
+                }
+            }
+            asset_manager::AssetManagerAction::RemoveRow(row_id) => {
+                self.asset_index.remove(&row_id);
+                self.asset_manager_state.checked.remove(&row_id);
+                self.save_asset_index();
+            }
+            asset_manager::AssetManagerAction::ClearFinished => {
+                self.asset_index.records.retain(|r| !r.state.is_terminal());
+                self.save_asset_index();
+            }
+            asset_manager::AssetManagerAction::RetryRow(row_id) => {
+                if let Some(record) = self.asset_index.get_mut(&row_id) {
+                    record.state = AssetState::Queued;
+                    // A hand-pressed retry is a fresh decision, so it gets a
+                    // fresh budget and goes out now rather than serving out the
+                    // backoff of the automatic attempts that preceded it.
+                    record.attempts = 0;
+                    record.retry_at = None;
+                }
+                self.save_asset_index();
+                self.dispatch_next_uploads();
+            }
+            asset_manager::AssetManagerAction::RequestUpload(rows) => {
+                self.asset_manager_state.confirm_upload = Some(rows.len());
+                self.pending_upload_rows = rows;
+            }
+            asset_manager::AssetManagerAction::LoadInventory { node, filter } => {
+                // "All types" is a fan-out, not a filter: the listing endpoint
+                // requires an assetType, so one request per kind is the only
+                // way to honor the label.
+                let kinds: Vec<ram_core::assets::AssetKind> = match filter {
+                    Some(kind) => vec![kind],
+                    None => ram_core::assets::AssetKind::selectable().to_vec(),
+                };
+                self.remote_inventory = asset_manager::RemoteInventory {
+                    node: Some(node),
+                    filter,
+                    requested: true,
+                    inflight: kinds.len(),
+                    ..Default::default()
+                };
+                for kind in kinds {
+                    self.fetch_creations(node, kind, None);
+                }
+            }
+            asset_manager::AssetManagerAction::LoadMoreInventory => {
+                let Some(node) = self.remote_inventory.node else {
+                    return;
+                };
+                // Advance every kind that still has a page left.
+                let pending: Vec<(ram_core::assets::AssetKind, String)> = self
+                    .remote_inventory
+                    .cursors
+                    .drain()
+                    .collect();
+                self.remote_inventory.inflight += pending.len();
+                for (kind, cursor) in pending {
+                    self.fetch_creations(node, kind, Some(cursor));
+                }
+            }
+            asset_manager::AssetManagerAction::RevealFile(path) => {
+                // `/select,` highlights the file rather than just opening its
+                // folder. Explorer wants a native separator here.
+                let _ = std::process::Command::new("explorer")
+                    .arg(format!("/select,{}", path.display()))
+                    .spawn();
+            }
+            asset_manager::AssetManagerAction::OpenGrantDialog => {
+                self.asset_manager_state.grant_open = true;
+                // Refresh the picker each time it opens: the acting account may
+                // have changed since the last fetch.
+                if self.universe_targets_user != self.asset_manager_state.acting_user_id {
+                    self.fetch_universe_targets(None);
+                }
+            }
+        }
+    }
+
+    /// Hash and queue a batch of files. Anything unsupported still gets a row,
+    /// marked invalid with the reason, rather than being silently dropped: a
+    /// file that vanishes from a drop of twenty reads as a bug.
+    fn stage_files(&mut self, paths: Vec<PathBuf>) {
+        let Some(user_id) = self.asset_manager_state.acting_user_id else {
+            self.toasts
+                .push(Toast::error("Select an account to upload from first"));
+            return;
+        };
+        let creator = self
+            .asset_manager_state
+            .batch_creator
+            .unwrap_or(ram_core::assets::Creator::User(user_id));
+        let now = chrono::Utc::now();
+        let mut added = 0usize;
+        let mut duplicates = 0usize;
+
+        for path in paths {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let row_id = uuid::Uuid::new_v4().to_string();
+
+            let (kind, invalid) = match ram_core::assets::validate_file(&path, size) {
+                Ok((kind, _)) => (kind, None),
+                Err(reason) => (ram_core::assets::AssetKind::Other, Some(reason)),
+            };
+
+            let mut record = ram_core::assets::AssetRecord::staged(
+                row_id.clone(),
+                ram_core::assets::StagedFile {
+                    path,
+                    // Hashing happens on the backend thread just before upload,
+                    // so a queue of large files does not freeze the UI here.
+                    sha256: String::new(),
+                    bytes: size,
+                    kind,
+                },
+                creator,
+                user_id,
+                now,
+            );
+
+            if let Some(reason) = invalid {
+                record.state = AssetState::Invalid { reason };
+            } else if let Some(existing) = self
+                .asset_index
+                .records
+                .iter()
+                .find(|r| r.file_path == record.file_path && r.creator == creator)
+                .and_then(|r| r.state.asset_id())
+            {
+                // Same file, same creator, already uploaded. Flag it rather
+                // than silently re-uploading: assets are permanent and audio
+                // burns a per-account quota.
+                record.state = AssetState::Duplicate {
+                    asset_id: existing,
+                };
+                duplicates += 1;
+            } else {
+                self.asset_manager_state.checked.insert(row_id);
+                added += 1;
+            }
+            self.asset_index.records.push(record);
+        }
+
+        self.save_asset_index();
+        if duplicates > 0 {
+            self.toasts.push(Toast::info(format!(
+                "{added} file(s) queued, {duplicates} already uploaded"
+            )));
+        } else if added > 0 {
+            self.toasts
+                .push(Toast::info(format!("{added} file(s) queued")));
+        }
+    }
+
+    /// Confirmation before any batch. Uploads are permanent, public, and
+    /// moderated under a real account, so this is not a formality.
+    fn show_upload_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(count) = self.asset_manager_state.confirm_upload else {
+            return;
+        };
+        let total_bytes: u64 = self
+            .pending_upload_rows
+            .iter()
+            .filter_map(|id| self.asset_index.get(id))
+            .map(|r| r.file_bytes)
+            .sum();
+        let creator = self
+            .pending_upload_rows
+            .first()
+            .and_then(|id| self.asset_index.get(id))
+            .map(|r| r.creator);
+        let creator_text = match creator {
+            Some(ram_core::assets::Creator::User(id)) => self
+                .store
+                .find_by_id(id)
+                .map(|a| a.label().to_string())
+                .unwrap_or_else(|| format!("user {id}")),
+            Some(ram_core::assets::Creator::Group(id)) => format!("group {id}"),
+            None => "the selected account".to_string(),
+        };
+
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+        egui::Window::new("Confirm upload")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Upload {count} file(s), {:.1} MB in total, as {creator_text}.",
+                    total_bytes as f64 / (1024.0 * 1024.0)
+                ));
+                ui.add_space(4.0);
+                ui.colored_label(
+                    ui.theme().warning,
+                    "This cannot be undone. Every asset is permanent, public, and moderated \
+                     under that account.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let upload = egui::Button::new(
+                        egui::RichText::new("Upload").color(ui.theme().on_accent),
+                    )
+                    .fill(ui.visuals().selection.bg_fill);
+                    if ui.add(upload).clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if confirmed {
+            let rows = std::mem::take(&mut self.pending_upload_rows);
+            let auto_grant = self.asset_manager_state.auto_grant_universe;
+            for row_id in rows {
+                if let Some(record) = self.asset_index.get_mut(&row_id) {
+                    record.state = AssetState::Queued;
+                    // Stamped per row at confirm time, not read from UI state
+                    // later, so changing the selector mid-batch cannot retarget
+                    // uploads that are already in flight.
+                    record.auto_grant_universe = auto_grant;
+                }
+            }
+            self.asset_manager_state.confirm_upload = None;
+            self.save_asset_index();
+            self.dispatch_next_uploads();
+        } else if cancelled || !open {
+            self.asset_manager_state.confirm_upload = None;
+            self.pending_upload_rows.clear();
+        }
+    }
+
     fn show_settings_tab(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let has_password = !self.master_password.is_empty();
+            let has_password = self
+                .store_session
+                .as_ref()
+                .is_some_and(|s| s.needs_password());
             let action = settings::show(
                 ui,
                 &mut self.config,
@@ -1650,24 +3828,20 @@ impl AppState {
                     self.toasts.push(Toast::info("Multi-instance disabled (takes effect after restart)"));
                 }
                 Some(settings::SettingsAction::ChangePassword { new_password }) => {
-                    let old_password = self.master_password.clone();
-                    // Re-encrypt every account's cookie with the new password
-                    for account in &mut self.store.accounts {
-                        if let Some(ref enc) = account.encrypted_cookie {
-                            if let Ok(plain) = ram_core::crypto::decrypt_cookie(enc, &old_password) {
-                                if let Ok(new_enc) = ram_core::crypto::encrypt_cookie(&plain, &new_password) {
-                                    account.encrypted_cookie = Some(new_enc);
-                                }
-                            }
-                        }
-                    }
-                    self.master_password = new_password;
-                    self.auto_save();
-                    self.toasts.push(Toast::success("Password changed - store re-encrypted"));
+                    // Rewraps the data key under the new password. The old
+                    // version walked every account re-encrypting cookies one by
+                    // one and swallowed failures, which left any cookie that
+                    // failed to decrypt stranded on the previous password with
+                    // no way back. Nothing per-account happens here at all now.
+                    self.rekey_store(Some(new_password));
                 }
                 Some(settings::SettingsAction::ClearPassword) => {
-                    self.master_password.clear();
-                    self.toasts.push(Toast::info("Password cleared"));
+                    // Rewraps under the device key. The old version merely
+                    // cleared the in-memory password, which left the file on
+                    // disk encrypted under a password the app no longer had —
+                    // and silently stopped saving, because `auto_save` was
+                    // gated on that string being non-empty.
+                    self.rekey_store(None);
                 }
                 None => {}
             }
@@ -1700,18 +3874,15 @@ impl AppState {
                     self.add_dialog.browser_login_pending = false;
                     self.add_dialog.browser_login_rx = None;
                     self.add_dialog.last_error = None;
-                    // If the user already has a master password set (or
-                    // credential-manager mode is on), there's nothing left
-                    // for them to confirm — send the cookie straight to the
-                    // backend instead of making them click "Add" redundantly.
-                    let needs_password = !self.config.use_credential_manager
-                        && self.master_password.is_empty();
-                    if !needs_password {
-                        let cookie = self.add_dialog.cookie_input.trim().to_string();
+                    // Nothing left for the user to confirm: encryption sets
+                    // itself up. Send the cookie straight to the backend rather
+                    // than making them click "Add" redundantly.
+                    let cookie = self.add_dialog.cookie_input.trim().to_string();
+                    if let Some(session) = self.ensure_session() {
                         self.add_dialog.loading = true;
                         self.bridge.send(BackendCommand::AddAccount {
                             cookie,
-                            password: self.master_password.clone(),
+                            session,
                             use_credential_manager: self.config.use_credential_manager,
                         });
                     }
@@ -1759,9 +3930,9 @@ impl AppState {
                     let info = acc.moderation.as_ref().expect("moderation present");
                     let banned = info.is_banned;
                     let title_color = if banned {
-                        egui::Color32::from_rgb(255, 110, 110)
+                        ui.theme().danger_text
                     } else {
-                        egui::Color32::from_rgb(240, 180, 80)
+                        ui.theme().warning_text
                     };
                     ui.colored_label(
                         title_color,
@@ -1863,14 +4034,16 @@ impl AppState {
                     let profile_dir = crate::data_dir()
                         .join("webview_browse_as")
                         .join(uid.to_string());
-                    self.bridge.send(BackendCommand::BrowseAsAccount {
-                        user_id: uid,
-                        encrypted_cookie: enc,
-                        password: self.master_password.clone(),
-                        use_credential_manager: self.config.use_credential_manager,
-                        profile_dir,
-                        label,
-                    });
+                    if let Some(session) = self.session() {
+                        self.bridge.send(BackendCommand::BrowseAsAccount {
+                            user_id: uid,
+                            encrypted_cookie: enc,
+                            session,
+                            use_credential_manager: self.config.use_credential_manager,
+                            profile_dir,
+                            label,
+                        });
+                    }
                 }
             }
             if mod_revalidate {
@@ -1880,20 +4053,23 @@ impl AppState {
                 // pasted the cookie fresh, so a clean account now skips the
                 // moderation confirm.
                 if let Some(pending) = self.add_dialog.pending_moderated.take() {
+                    let session = self.session();
                     let raw_cookie = if self.config.use_credential_manager {
                         ram_core::crypto::credential_load(pending.account.user_id).ok()
                     } else {
-                        pending.encrypted_cookie.as_ref().and_then(|enc| {
-                            ram_core::crypto::decrypt_cookie(enc, &self.master_password).ok()
-                        })
+                        pending
+                            .encrypted_cookie
+                            .as_ref()
+                            .zip(session.as_ref())
+                            .and_then(|(enc, s)| ram_core::crypto::decrypt_cookie(enc, s).ok())
                     };
-                    match raw_cookie {
-                        Some(cookie) => {
+                    match raw_cookie.zip(session) {
+                        Some((cookie, session)) => {
                             self.add_dialog.loading = true;
                             self.add_dialog.last_error = None;
                             self.bridge.send(BackendCommand::AddAccount {
                                 cookie,
-                                password: self.master_password.clone(),
+                                session,
                                 use_credential_manager: self.config.use_credential_manager,
                             });
                         }
@@ -1921,7 +4097,6 @@ impl AppState {
                     self.toasts.push(Toast::success(format!("Added {name}")));
                     self.add_dialog.open = false;
                     self.add_dialog.cookie_input.clear();
-                    self.add_dialog.password_input.clear();
                     self.add_dialog.browser_login_pending = false;
                     self.add_dialog.browser_login_rx = None;
                     self.tutorial.advance_from(tutorial::TutorialStep::EnterCookie);
@@ -1939,7 +4114,6 @@ impl AppState {
                 self.add_dialog.pending_moderated = None;
                 self.add_dialog.open = false;
                 self.add_dialog.cookie_input.clear();
-                self.add_dialog.password_input.clear();
                 self.add_dialog.browser_login_pending = false;
                 self.add_dialog.browser_login_rx = None;
             }
@@ -2036,7 +4210,7 @@ impl AppState {
                         } else if !self.add_dialog.cookie_input.is_empty() {
                             ui.label(
                                 egui::RichText::new("Cookie captured.")
-                                    .color(egui::Color32::from_rgb(120, 200, 120)),
+                                    .color(ui.theme().success_text),
                             );
                         } else {
                             ui.label("Sign-in canceled.");
@@ -2199,33 +4373,11 @@ impl AppState {
                             );
                             ui.add_space(8.0);
 
-                            let needs_password = !self
-                                .config
-                                .use_credential_manager
-                                && self.master_password.is_empty();
-                            if needs_password {
-                                ui.label(
-                                    "Set a master password for encryption:",
-                                );
-                                ui.add(
-                                    egui::TextEdit::singleline(
-                                        &mut self.add_dialog.password_input,
-                                    )
-                                    .password(true)
-                                    .hint_text("Master password"),
-                                );
-                                ui.add_space(4.0);
-                            }
-
-                            let valid = count > 0
-                                && (!needs_password
-                                    || !self
-                                        .add_dialog
-                                        .password_input
-                                        .is_empty());
+                            // No password prompt: `dispatch_next_bulk` sets up
+                            // device-locked encryption on its own.
                             if ui
                                 .add_enabled(
-                                    valid,
+                                    count > 0,
                                     egui::Button::new(format!(
                                         "Import {count} account(s)",
                                     )),
@@ -2237,12 +4389,6 @@ impl AppState {
                                 );
                                 // Reverse so pop() yields paste order.
                                 cookies.reverse();
-                                if needs_password {
-                                    self.master_password = self
-                                        .add_dialog
-                                        .password_input
-                                        .clone();
-                                }
                                 self.add_dialog.bulk_total = cookies.len();
                                 self.add_dialog.bulk_succeeded = 0;
                                 self.add_dialog.bulk_failed = 0;
@@ -2255,9 +4401,12 @@ impl AppState {
                     }
                 }
 
-                // Shared footer — master password (if needed), error, submit.
-                // Skipped on Choose (nothing to submit) and Bulk (handles its
-                // own submit/progress UI above).
+                // Shared footer — error and submit. Skipped on Choose (nothing
+                // to submit) and Bulk (handles its own submit/progress UI).
+                //
+                // There is no master-password field here any more: a new store
+                // is device-locked, which needs nothing from the user. Setting a
+                // password is now a deliberate choice made in Settings.
                 if matches!(
                     self.add_dialog.step,
                     AddAccountStep::Choose | AddAccountStep::Bulk
@@ -2265,24 +4414,11 @@ impl AppState {
                     return;
                 }
 
-                let needs_password = !self.config.use_credential_manager
-                    && self.master_password.is_empty();
-                if needs_password {
-                    ui.label("Set a master password for encryption:");
-                    ui.add_enabled(
-                        !self.add_dialog.loading,
-                        egui::TextEdit::singleline(&mut self.add_dialog.password_input)
-                            .password(true)
-                            .hint_text("Master password"),
-                    );
-                    ui.add_space(4.0);
-                }
-
                 if let Some(err) = &self.add_dialog.last_error {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.colored_label(
-                            egui::Color32::from_rgb(200, 60, 60),
+                            ui.theme().danger,
                             format!("⚠ {err}"),
                         );
                     });
@@ -2295,8 +4431,7 @@ impl AppState {
                         ui.label("Validating cookie...");
                     });
                 } else {
-                    let valid = !self.add_dialog.cookie_input.trim().is_empty()
-                        && (!needs_password || !self.add_dialog.password_input.is_empty());
+                    let valid = !self.add_dialog.cookie_input.trim().is_empty();
                     let button_label = if self.add_dialog.last_error.is_some() {
                         "Retry"
                     } else {
@@ -2308,18 +4443,17 @@ impl AppState {
                             .clicked()
                         {
                             let cookie = self.add_dialog.cookie_input.trim().to_string();
-                            if needs_password {
-                                self.master_password =
-                                    self.add_dialog.password_input.clone();
+                            // Sets up device-locked encryption on the first add.
+                            if let Some(session) = self.ensure_session() {
+                                self.add_dialog.loading = true;
+                                self.add_dialog.last_error = None;
+                                self.add_dialog.rejected_cookie = None;
+                                self.bridge.send(BackendCommand::AddAccount {
+                                    cookie,
+                                    session,
+                                    use_credential_manager: self.config.use_credential_manager,
+                                });
                             }
-                            self.add_dialog.loading = true;
-                            self.add_dialog.last_error = None;
-                            self.add_dialog.rejected_cookie = None;
-                            self.bridge.send(BackendCommand::AddAccount {
-                                cookie,
-                                password: self.master_password.clone(),
-                                use_credential_manager: self.config.use_credential_manager,
-                            });
                         }
                         // When the backend rejected the cookie, give the user
                         // a way to investigate (e.g. see the moderation page)
@@ -2439,20 +4573,20 @@ impl AppState {
                                             .force_add_username
                                             .trim()
                                             .to_string();
-                                        self.add_dialog.loading = true;
-                                        self.add_dialog.last_error = None;
-                                        self.bridge.send(
-                                            BackendCommand::AddAccountForced {
-                                                cookie,
-                                                username,
-                                                password: self
-                                                    .master_password
-                                                    .clone(),
-                                                use_credential_manager: self
-                                                    .config
-                                                    .use_credential_manager,
-                                            },
-                                        );
+                                        if let Some(session) = self.ensure_session() {
+                                            self.add_dialog.loading = true;
+                                            self.add_dialog.last_error = None;
+                                            self.bridge.send(
+                                                BackendCommand::AddAccountForced {
+                                                    cookie,
+                                                    username,
+                                                    session,
+                                                    use_credential_manager: self
+                                                        .config
+                                                        .use_credential_manager,
+                                                },
+                                            );
+                                        }
                                     }
                                     if ui.button("Cancel").clicked() {
                                         self.add_dialog.force_add_form_open = false;
@@ -2502,6 +4636,326 @@ impl AppState {
             });
         if !keep_open {
             self.confirm_remove = None;
+        }
+    }
+
+    /// The one-time offer, shown to an existing password user after they
+    /// unlock, to switch this PC over to automatic unlocking.
+    ///
+    /// Deliberately a question rather than a silent migration: dropping a
+    /// password someone chose to set is a security-relevant change, and the
+    /// answer is remembered either way so it is asked exactly once.
+    fn show_passwordless_offer_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_passwordless_offer {
+            return;
+        }
+        let mut open = true;
+        let mut accept = false;
+        let mut decline = false;
+
+        egui::Window::new("Stop asking for your password?")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(430.0);
+                ui.label(
+                    "RM can unlock your accounts automatically on this PC, so you never have \
+                     to type a master password again.",
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Your accounts stay encrypted either way. The difference is where the \
+                         key comes from: Windows Credential Manager instead of your password.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Keep the password if you want the store to stay unreadable even to \
+                         someone using your Windows account.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Stop asking on this PC").clicked() {
+                        accept = true;
+                    }
+                    if ui.button("Keep my password").clicked() {
+                        decline = true;
+                    }
+                });
+            });
+
+        if accept {
+            self.rekey_store(None);
+        }
+        if accept || decline || !open {
+            self.dismiss_passwordless_offer();
+        }
+    }
+
+    /// Recovery options on the unlock screen.
+    ///
+    /// The original version of this dialog offered exactly one action, wiping
+    /// the store, on the premise that a failed unlock means a forgotten
+    /// password. It does not: an AES-GCM authentication failure is equally
+    /// consistent with a damaged file, which `crypto` recovers from
+    /// automatically using the very `.bak` that wiping deletes. So this dialog
+    /// leads with the non-destructive options, names the files, and puts the
+    /// wipe behind a typed confirmation.
+    fn show_recovery_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_recovery {
+            return;
+        }
+        let store_path = self.config.accounts_path.clone();
+        let backup = ram_core::storage::backup_path(&store_path);
+        let folder = store_path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let device_mode = self.device_key_missing;
+
+        let mut open = true;
+        let mut wipe = false;
+        let mut cancel = false;
+        let mut reveal = false;
+
+        egui::Window::new("Recovery Options")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+
+                if device_mode {
+                    ui.label(
+                        "This store is locked to a PC whose key is no longer available, so \
+                         there is no password that will open it here.",
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        "If you still have the original PC, copy the store back from there. \
+                         Otherwise the accounts will have to be added again.",
+                    );
+                } else {
+                    ui.label("Two different things produce this error:");
+                    ui.add_space(6.0);
+                    ui.label("• The password is wrong. Try other passwords first.");
+                    ui.label(
+                        "• The file is damaged. RM already tried the backup automatically, \
+                         so this is the less likely of the two.",
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "There is no way to recover the accounts without the password. \
+                             The encryption has no back door, by design.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.label(
+                    egui::RichText::new("Before wiping anything, copy these files somewhere safe:")
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("{}\n{}", store_path.display(), backup.display()))
+                        .small()
+                        .monospace(),
+                );
+                ui.add_space(6.0);
+                if !folder.is_empty() && ui.button("📂  Open containing folder").clicked() {
+                    reveal = true;
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.label(
+                    egui::RichText::new("Start over with an empty account store")
+                        .strong()
+                        .color(ui.theme().danger),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    "This permanently deletes the store and its backup, and any cookies RM \
+                     saved to Windows Credential Manager. It cannot be undone. Your settings, \
+                     presets and private servers are kept.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Type");
+                    ui.label(egui::RichText::new("DELETE").strong().monospace());
+                    ui.label("to confirm:");
+                });
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.recovery_confirm_input)
+                        .hint_text("DELETE")
+                        .desired_width(140.0),
+                );
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let confirmed = self.recovery_confirm_input.trim() == "DELETE";
+                    if ui
+                        .add_enabled(
+                            confirmed,
+                            egui::Button::new("🗑  Delete everything and start over"),
+                        )
+                        .clicked()
+                    {
+                        wipe = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if reveal {
+            self.reveal_in_file_manager(&store_path);
+        }
+        self.show_recovery = open && !cancel && !wipe;
+        if cancel || wipe || !open {
+            self.recovery_confirm_input.clear();
+        }
+        if wipe {
+            self.wipe_account_store();
+        }
+    }
+
+    /// Open the store's folder in the OS file manager so the user can copy the
+    /// files out before wiping.
+    fn reveal_in_file_manager(&mut self, path: &std::path::Path) {
+        let Some(folder) = path.parent() else {
+            return;
+        };
+        #[cfg(windows)]
+        let result = std::process::Command::new("explorer").arg(folder).spawn();
+        #[cfg(target_os = "macos")]
+        let result = std::process::Command::new("open").arg(folder).spawn();
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        let result = std::process::Command::new("xdg-open").arg(folder).spawn();
+
+        if let Err(e) = result {
+            tracing::warn!("Could not open {}: {e}", folder.display());
+            self.toasts
+                .push(Toast::error(format!("Could not open {}", folder.display())));
+        }
+    }
+
+    /// Delete the account store, its backup and every credential RM owns, then
+    /// carry on in-process with an empty store.
+    ///
+    /// Deliberately does not relaunch. Spawning a replacement and calling
+    /// `exit(0)` raced the process being replaced: the child runs
+    /// `AppState::new`, which re-acquires the Roblox singleton mutex, while the
+    /// parent still holds it, so multi-instance silently switched itself off.
+    /// `exit(0)` also skipped the config save. Resetting state in place has
+    /// neither problem and lands the user on the same first-run screen.
+    fn wipe_account_store(&mut self) {
+        let store_path = self.config.accounts_path.clone();
+
+        // Credential Manager entries first, while the roster that names them is
+        // still loaded. Deleting the store first would orphan them permanently:
+        // nothing else records which user IDs RM created.
+        let mut orphaned = 0usize;
+        for account in &self.store.accounts {
+            if let Err(e) = ram_core::crypto::credential_delete(account.user_id) {
+                tracing::warn!(
+                    "Could not delete the credential for user {}: {e}",
+                    account.user_id
+                );
+                orphaned += 1;
+            }
+        }
+        if let Err(e) = ram_core::crypto::delete_device_key() {
+            tracing::warn!("Could not delete the device key: {e}");
+        }
+
+        // Both copies, and any temp file a crashed write left behind.
+        let mut failed = Vec::new();
+        for path in [
+            store_path.clone(),
+            ram_core::storage::backup_path(&store_path),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::info!("Deleted {}", path.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!("Could not delete {}: {e}", path.display());
+                    failed.push(path);
+                }
+            }
+        }
+
+        if !failed.is_empty() {
+            // Report exactly what survived. The previous version claimed total
+            // failure after having already deleted the backup, which left the
+            // user believing their data was intact when the recovery copy was
+            // already gone.
+            let names: Vec<String> = failed
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string())
+                })
+                .collect();
+            self.toasts.push(Toast::error(format!(
+                "Could not delete {}. Delete it by hand, then restart RM.",
+                names.join(" and ")
+            )));
+            return;
+        }
+
+        // Reset in place. `store_session` is dropped here, which zeroes the
+        // data key it held.
+        self.store = AccountStore::default();
+        self.store_session = None;
+        self.needs_unlock = false;
+        self.unlocking = false;
+        self.device_key_missing = false;
+        self.pending_legacy_upgrade = false;
+        self.show_passwordless_offer = false;
+        self.unlock_password_input.clear();
+        self.unlock_password_used.clear();
+        self.selected_ids.clear();
+        self.avatar_bytes.clear();
+        self.anonymized_avatar_bytes.clear();
+        self.active_tab = Tab::Accounts;
+
+        // A store created from here on is passwordless, so the one-time offer
+        // has nothing left to ask about.
+        self.config.offered_passwordless = true;
+        if let Err(e) = self.config.save(&self.config_path) {
+            tracing::warn!("Could not save config after wiping the store: {e}");
+        }
+
+        if orphaned > 0 {
+            self.toasts.push(Toast::error(format!(
+                "Account store deleted, but {orphaned} saved credential(s) could not be removed"
+            )));
+        } else {
+            self.toasts
+                .push(Toast::success("Account store deleted. Add an account to start over."));
         }
     }
 
@@ -2611,5 +5065,224 @@ impl AppState {
             });
         }
         ui.label(job);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ram_core::instances::{Attribution, TrackedInstance};
+    use ram_core::models::Account;
+
+    /// A client RM read the launchtime off, which is the normal case.
+    fn instance(pid: u32, user_id: u64) -> TrackedInstance {
+        TrackedInstance {
+            pid,
+            start_time: 1_000,
+            user_id,
+            place_id: 606,
+            launchtime: 1_700_000_000_000 + pid as i64,
+            launched_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            attribution: Attribution::Exact,
+        }
+    }
+
+    /// A client whose command line could not be read, paired by appearance
+    /// order.
+    fn guessed(pid: u32, user_id: u64) -> TrackedInstance {
+        TrackedInstance {
+            attribution: Attribution::Inferred,
+            ..instance(pid, user_id)
+        }
+    }
+
+    fn account(user_id: u64, username: &str) -> Account {
+        Account::new(user_id, username.to_string(), username.to_string())
+    }
+
+    #[test]
+    fn nothing_tracked_says_so_without_claiming_there_is_nothing_running() {
+        let summary = attribution_summary(&[], &[account(7, "alice")], false, 3);
+        assert_eq!(
+            summary,
+            "None of these were launched by RM, or they have not been \
+             matched to an account yet."
+        );
+        // The early return means the count is not mentioned at all, which is
+        // the point: with no mappings there is nothing to say about which of
+        // the three is whose.
+        assert!(!summary.contains('3'), "{summary}");
+    }
+
+    #[test]
+    fn each_tracked_pid_is_listed_against_its_account_label() {
+        let accounts = vec![account(7, "alice"), account(8, "bob")];
+        let tracked = vec![instance(1234, 7), instance(5678, 8)];
+
+        let summary = attribution_summary(&tracked, &accounts, false, 2);
+
+        assert_eq!(
+            summary,
+            "Launched by RM:\n  PID 1234 - alice\n  PID 5678 - bob"
+        );
+    }
+
+    /// The heading no longer hedges, so the hedge has to live on the individual
+    /// line that earned it. A confirmed line and a guessed line must not read
+    /// the same.
+    #[test]
+    fn only_the_guessed_lines_are_marked_as_guesses() {
+        let accounts = vec![account(7, "alice"), account(8, "bob")];
+        let tracked = vec![instance(1234, 7), guessed(5678, 8)];
+
+        let summary = attribution_summary(&tracked, &accounts, false, 2);
+
+        assert_eq!(
+            summary,
+            "Launched by RM:\n  PID 1234 - alice\n  PID 5678 - bob  (best guess)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Window titles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn each_attributed_client_is_titled_with_its_account_label() {
+        let mut bob = account(8, "bob");
+        bob.alias = "farmer".to_string();
+        let accounts = vec![account(7, "alice"), bob];
+        let tracked = vec![instance(1234, 7), instance(5678, 8)];
+
+        assert_eq!(
+            instance_window_titles(&tracked, &accounts, false),
+            vec![
+                (1234, "alice".to_string()),
+                // The alias, matching what the sidebar shows.
+                (5678, "farmer".to_string()),
+            ]
+        );
+    }
+
+    /// The one that matters. A window title is readable by every process on the
+    /// machine and appears in screenshots and screen shares, so a user who
+    /// turned anonymize on must not have their username written into one.
+    #[test]
+    fn anonymize_keeps_names_out_of_window_titles() {
+        let mut bob = account(8, "bob");
+        bob.alias = "farmer".to_string();
+        let accounts = vec![account(7, "alice"), bob];
+        let tracked = vec![instance(1234, 7), instance(5678, 8)];
+
+        let titles = instance_window_titles(&tracked, &accounts, true);
+
+        for (_, title) in &titles {
+            assert!(!title.contains("alice"), "{title}");
+            assert!(!title.contains("bob"), "{title}");
+            assert!(!title.contains("farmer"), "alias leaked: {title}");
+        }
+        assert_eq!(
+            titles,
+            vec![
+                (1234, format!("Account #{}", sidebar::anon_tag(7))),
+                (5678, format!("Account #{}", sidebar::anon_tag(8))),
+            ]
+        );
+    }
+
+    /// An inferred mapping still gets a title. Being wrong writes the wrong
+    /// name on a title bar, which is cosmetic, unlike being wrong about a kill.
+    #[test]
+    fn an_inferred_client_is_titled_too() {
+        let accounts = vec![account(7, "alice")];
+        assert_eq!(
+            instance_window_titles(&[guessed(1234, 7)], &accounts, false),
+            vec![(1234, "alice".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_client_whose_account_is_gone_is_titled_with_its_raw_id() {
+        assert_eq!(
+            instance_window_titles(&[instance(1234, 99)], &[], false),
+            vec![(1234, "user 99".to_string())]
+        );
+    }
+
+    /// The label, not the username: an aliased account is shown the way the
+    /// sidebar shows it.
+    #[test]
+    fn an_alias_wins_over_the_username() {
+        let mut a = account(7, "alice");
+        a.alias = "main".to_string();
+        let summary = attribution_summary(&[instance(1234, 7)], &[a], false, 1);
+        assert!(summary.contains("PID 1234 - main"), "{summary}");
+        assert!(!summary.contains("alice"), "{summary}");
+    }
+
+    /// The stale-attribution case: the registry still maps a PID to an account
+    /// the store no longer has. It must degrade to the raw ID rather than drop
+    /// the line or panic.
+    #[test]
+    fn an_instance_whose_account_is_gone_falls_back_to_the_raw_id() {
+        let summary = attribution_summary(&[instance(1234, 99)], &[], false, 1);
+        assert!(summary.contains("PID 1234 - user 99"), "{summary}");
+    }
+
+    #[test]
+    fn anonymize_replaces_every_name_with_its_stable_tag() {
+        let accounts = vec![account(7, "alice"), account(8, "bob")];
+        let tracked = vec![instance(1234, 7), instance(5678, 8)];
+
+        let summary = attribution_summary(&tracked, &accounts, true, 2);
+
+        assert!(!summary.contains("alice"), "{summary}");
+        assert!(!summary.contains("bob"), "{summary}");
+        assert!(
+            summary.contains(&format!("PID 1234 - Account #{}", sidebar::anon_tag(7))),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&format!("PID 5678 - Account #{}", sidebar::anon_tag(8))),
+            "{summary}"
+        );
+    }
+
+    /// Anonymizing hides the name, not the identity of the account the store
+    /// no longer knows: there is no name to hide, so the raw ID still shows.
+    /// Worth pinning because it is the one way a user ID reaches the tooltip
+    /// with anonymize on.
+    #[test]
+    fn anonymize_does_not_cover_an_account_missing_from_the_store() {
+        let summary = attribution_summary(&[instance(1234, 99)], &[], true, 1);
+        assert!(summary.contains("PID 1234 - user 99"), "{summary}");
+    }
+
+    #[test]
+    fn clients_rm_did_not_launch_are_counted_on_a_trailing_line() {
+        let accounts = vec![account(7, "alice")];
+        let summary = attribution_summary(&[instance(1234, 7)], &accounts, false, 4);
+        assert!(
+            summary.ends_with("3 other instance(s) not matched to an account."),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn the_trailing_line_is_omitted_when_rm_launched_everything() {
+        let accounts = vec![account(7, "alice")];
+        let summary = attribution_summary(&[instance(1234, 7)], &accounts, false, 1);
+        assert!(!summary.contains("other instance"), "{summary}");
+    }
+
+    /// The subtraction is saturating for a reason: the running count comes from
+    /// a different sample of the process table than the map, so it can lag
+    /// behind and be smaller. That must not underflow.
+    #[test]
+    fn a_running_count_behind_the_map_does_not_underflow() {
+        let accounts = vec![account(7, "alice"), account(8, "bob")];
+        let tracked = vec![instance(1234, 7), instance(5678, 8)];
+        let summary = attribution_summary(&tracked, &accounts, false, 0);
+        assert!(!summary.contains("other instance"), "{summary}");
     }
 }

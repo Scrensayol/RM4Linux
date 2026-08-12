@@ -1,13 +1,120 @@
-#![windows_subsystem = "windows"]
+// The release binary is a GUI app with no console. Under `cargo test` the same
+// attribute would detach the test harness from its console and swallow every
+// result, so it is applied only to non-test builds.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod app;
 mod bridge;
 mod browser_login;
 mod components;
+mod theme;
 mod toast;
 
 use std::path::PathBuf;
+use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::EnvFilter;
+
+// ---------------------------------------------------------------------------
+// Log file
+// ---------------------------------------------------------------------------
+
+/// Rotated log files kept on disk, oldest deleted first. One file per day, so
+/// this is roughly a week of history.
+const LOG_FILES_KEPT: usize = 7;
+
+/// Open the rotating log file under `data_dir`, or `None` if it cannot be
+/// created.
+fn log_appender(
+    data_dir: &std::path::Path,
+) -> Option<tracing_appender::rolling::RollingFileAppender> {
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("rm")
+        .filename_suffix("log")
+        .max_log_files(LOG_FILES_KEPT)
+        .build(data_dir)
+        .ok()
+}
+
+// ---------------------------------------------------------------------------
+// Log scrubbing
+// ---------------------------------------------------------------------------
+
+struct Scrubbed<M>(M);
+
+impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for Scrubbed<M> {
+    type Writer = ScrubbingWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        ScrubbingWriter::new(self.0.make_writer())
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        ScrubbingWriter::new(self.0.make_writer_for(meta))
+    }
+}
+
+struct ScrubbingWriter<W: std::io::Write> {
+    inner: W,
+    buf: Vec<u8>,
+}
+
+impl<W: std::io::Write> ScrubbingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+        }
+    }
+
+    fn emit(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let taken = std::mem::take(&mut self.buf);
+        let text = String::from_utf8_lossy(&taken);
+        self.inner
+            .write_all(ram_core::redact::scrub(&text).as_bytes())?;
+        self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for ScrubbingWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.emit()
+    }
+}
+
+impl<W: std::io::Write> Drop for ScrubbingWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.emit();
+    }
+}
+
+const LEGACY_LOG_PURGED_MARKER: &str = ".rm.log.purged";
+
+fn purge_legacy_log(data_dir: &std::path::Path) {
+    let marker = data_dir.join(LEGACY_LOG_PURGED_MARKER);
+    if marker.exists() {
+        return;
+    }
+    let legacy = data_dir.join("rm.log");
+    if legacy.is_file() {
+        match std::fs::remove_file(&legacy) {
+            Ok(()) => tracing::info!("Removed the pre-rotation rm.log"),
+            Err(e) => {
+                tracing::warn!("Could not remove the pre-rotation rm.log: {e}");
+                return;
+            }
+        }
+    }
+    let _ = ram_core::storage::atomic_swap(&marker, b"");
+}
 
 /// Canonical data directory: `%APPDATA%\RM` on Windows, `$HOME/.config/RM` on Linux.
 pub fn data_dir() -> PathBuf {
@@ -123,25 +230,25 @@ fn main() {
 
     // Log to a file so crashes are visible even without a console
     // (the #[windows_subsystem = "windows"] attribute suppresses stderr).
-    let log_path = data_dir.join("rm.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .ok();
-
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         );
 
-    if let Some(file) = log_file {
-        subscriber.with_writer(std::sync::Mutex::new(file)).init();
-    } else {
-        subscriber.init();
+    match log_appender(&data_dir) {
+        Some(appender) => subscriber.with_writer(Scrubbed(appender)).init(),
+        // No writable log directory. stderr goes nowhere under
+        // `windows_subsystem = "windows"`, so this run is effectively silent,
+        // but the app must still start.
+        None => subscriber.init(),
     }
 
     // Install a panic hook that flushes the message to the log before dying.
+    // Nothing extra is needed to make that flush happen: the appender writes
+    // straight to the file on every event (no `tracing_appender::non_blocking`
+    // worker thread), so by the time `error!` returns the bytes are already
+    // out. Introducing the non-blocking writer here would mean a panic could
+    // race its own log line to the exit.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("PANIC: {info}");
@@ -167,6 +274,11 @@ fn main() {
         let code = browser_login::run_browse_as_child(profile_dir, cookie_in, label);
         std::process::exit(code);
     }
+
+    // Get rid of the pre-rotation log, which predates the scrubbing writer and
+    // can still be holding launch URIs. After the subscriber is installed so
+    // the outcome is logged, and before anything else runs.
+    purge_legacy_log(&data_dir);
 
     // Offer to migrate legacy data from the exe directory
     maybe_migrate_legacy_data(&data_dir);
@@ -224,28 +336,180 @@ fn main() {
         Box::new(move |cc| {
             // Enable image loading for egui_extras (avatars, etc.)
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            apply_global_style(&cc.egui_ctx);
+            theme::install(&cc.egui_ctx, theme::Theme::dark());
             Ok(Box::new(app::AppState::new(config, config_path)))
         }),
     );
 }
 
-/// Tweak egui visuals so interactive widgets (TextEdits especially) stand out
-/// from the dark section frames they sit on. Default dark-theme widgets render
-/// with no border and a background indistinguishable from `extreme_bg_color`,
-/// which made input fields invisible next to their labels.
-fn apply_global_style(ctx: &eframe::egui::Context) {
-    ctx.style_mut(|style| {
-        let v = &mut style.visuals;
-        let border = eframe::egui::Color32::from_gray(80);
-        let border_hover = eframe::egui::Color32::from_gray(140);
-        let border_active = eframe::egui::Color32::from_rgb(110, 170, 230);
-        v.widgets.inactive.bg_stroke = eframe::egui::Stroke::new(1.0, border);
-        v.widgets.hovered.bg_stroke = eframe::egui::Stroke::new(1.0, border_hover);
-        v.widgets.active.bg_stroke = eframe::egui::Stroke::new(1.0, border_active);
-        // Slight rounding on inputs/buttons to soften the new borders.
-        v.widgets.inactive.rounding = eframe::egui::Rounding::same(3.0);
-        v.widgets.hovered.rounding = eframe::egui::Rounding::same(3.0);
-        v.widgets.active.rounding = eframe::egui::Rounding::same(3.0);
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    const COOKIE: &str = "_|WARNING:-DO-NOT-SHARE-THIS!--.ABCDEF0123456789";
+
+    /// A secret split across two `write` calls must still be caught. This is
+    /// the reason `ScrubbingWriter` buffers instead of scrubbing each chunk.
+    #[test]
+    fn scrubs_a_secret_that_straddles_two_writes() {
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        {
+            let mut w = ScrubbingWriter::new(SharedSink(Arc::clone(&sink)));
+            w.write_all(b"cookie=_|WARNING:-DO-NOT-").unwrap();
+            w.write_all(b"SHARE-THIS!--.ABCDEF0123456789\n").unwrap();
+        }
+        let out = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert!(!out.contains("ABCDEF"), "{out}");
+        assert!(out.contains("<redacted>"), "{out}");
+    }
+
+    /// The whole pipeline as `main` wires it: a real `fmt` subscriber writing
+    /// through `Scrubbed`. Guards against the layer being bypassed by the
+    /// formatter's own buffering.
+    #[test]
+    fn a_formatted_event_reaches_the_writer_already_scrubbed() {
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(Scrubbed(SharedSinkMaker(Arc::clone(&sink))))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!("leaking {COOKIE} from C:\\Users\\Keeper\\rm.log");
+        });
+
+        let out = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert!(!out.is_empty(), "nothing reached the writer");
+        assert!(!out.contains("ABCDEF"), "cookie survived: {out}");
+        assert!(!out.contains("Keeper"), "username survived: {out}");
+        // The non-secret part of the message must still be there, or the log is
+        // useless and nobody will keep the layer.
+        assert!(out.contains("leaking"), "{out}");
+    }
+
+    /// The appender writes a dated file into the data directory, and the
+    /// scrubbing layer is in front of it there too (not only in front of the
+    /// in-memory sink the tests above use).
+    #[test]
+    fn the_rotating_appender_writes_a_dated_scrubbed_file() {
+        let dir = std::env::temp_dir().join(format!("ram_logtest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let appender = log_appender(&dir).expect("appender should open in a temp dir");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(Scrubbed(appender))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!("session cookie {COOKIE}");
+        });
+
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(files.len(), 1, "expected exactly one log file: {files:?}");
+        let name = files[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            name.starts_with("rm.") && name.ends_with(".log") && name.len() > "rm..log".len(),
+            "not a dated log file: {name}"
+        );
+
+        let contents = std::fs::read_to_string(&files[0]).unwrap();
+        assert!(contents.contains("session cookie"), "{contents}");
+        assert!(!contents.contains("ABCDEF"), "cookie hit the file: {contents}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Legacy log purge
+    // -----------------------------------------------------------------------
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ram_purge_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The pre-rotation file goes, and the rotated ones beside it do not. The
+    /// second half is the part worth pinning: those are live history and are
+    /// named only one character apart.
+    #[test]
+    fn the_pre_rotation_log_is_removed_and_the_rotated_ones_are_not() {
+        let dir = temp_dir("basic");
+        std::fs::write(dir.join("rm.log"), b"gameinfo:LEAKED").unwrap();
+        std::fs::write(dir.join("rm.2026-08-05.log"), b"keep me").unwrap();
+        std::fs::write(dir.join("rm.2026-08-06.log"), b"keep me too").unwrap();
+
+        purge_legacy_log(&dir);
+
+        assert!(!dir.join("rm.log").exists(), "the legacy log survived");
+        assert!(dir.join("rm.2026-08-05.log").is_file());
+        assert!(dir.join("rm.2026-08-06.log").is_file());
+        assert!(dir.join(LEGACY_LOG_PURGED_MARKER).is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once, not on every start. A user who deliberately puts an `rm.log` back
+    /// (pinning an old session while debugging) must not have RM eat it on the
+    /// next launch.
+    #[test]
+    fn a_recreated_log_is_left_alone_on_later_starts() {
+        let dir = temp_dir("once");
+        std::fs::write(dir.join("rm.log"), b"old").unwrap();
+        purge_legacy_log(&dir);
+        assert!(!dir.join("rm.log").exists());
+
+        std::fs::write(dir.join("rm.log"), b"deliberately put back").unwrap();
+        purge_legacy_log(&dir);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("rm.log")).unwrap(),
+            "deliberately put back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh install has nothing to purge and must still stop checking.
+    #[test]
+    fn a_clean_data_dir_is_marked_without_touching_anything() {
+        let dir = temp_dir("clean");
+        purge_legacy_log(&dir);
+        assert!(dir.join(LEGACY_LOG_PURGED_MARKER).is_file());
+        assert!(!dir.join("rm.log").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Vec<u8>` behind a shared handle, as a plain `io::Write`.
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+    impl Write for SharedSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The same sink as a `MakeWriter`, so it can stand in for the log file.
+    struct SharedSinkMaker(Arc<Mutex<Vec<u8>>>);
+    impl<'a> MakeWriter<'a> for SharedSinkMaker {
+        type Writer = SharedSink;
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedSink(Arc::clone(&self.0))
+        }
+    }
 }

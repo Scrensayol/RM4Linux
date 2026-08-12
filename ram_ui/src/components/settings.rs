@@ -3,6 +3,8 @@
 use eframe::egui;
 use ram_core::models::AppConfig;
 
+use crate::theme::ThemeUi;
+
 /// Actions the settings panel can emit.
 #[allow(dead_code)]
 pub enum SettingsAction {
@@ -28,6 +30,7 @@ pub fn show(
     settings_state: &mut SettingsState,
     _roblox_running: bool,
 ) -> Option<SettingsAction> {
+    let theme = ui.theme();
     let mut action: Option<SettingsAction> = None;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -90,18 +93,31 @@ pub fn show(
                     "Close all Roblox processes (including tray) before enabling.",
                 );
             }
+        }
+        if config.multi_instance_enabled {
+            ui.colored_label(
+                theme.warning,
+                "\u{26a0} This interacts with Hyperion anti-cheat and may carry ban risk.",
+            );
+        }
+        if !config.multi_instance_enabled && _roblox_running {
+            ui.colored_label(
+                theme.text_muted,
+                "Close all Roblox processes (including tray) before enabling.",
+            );
+        }
 
-            ui.add_space(4.0);
-            ui.checkbox(
-                &mut config.kill_background_roblox,
-                "Kill Roblox tray/background processes automatically",
-            ).on_hover_text("Kills idle \"always running\" Roblox processes (--launch-to-tray).");
-            if config.multi_instance_enabled && !config.kill_background_roblox {
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 160, 40),
-                    "⚠ Recommended when multi-instance is enabled. Tray processes stack up.",
-                );
-            }
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut config.kill_background_roblox,
+            "Kill Roblox tray/background processes automatically",
+        ).on_hover_text("Kills idle \"always running\" Roblox processes (--launch-to-tray).");
+        if config.multi_instance_enabled && !config.kill_background_roblox {
+            ui.colored_label(
+                theme.warning,
+                "⚠ Recommended when multi-instance is enabled. Tray processes stack up.",
+            );
+        }
 
             ui.add_space(4.0);
             ui.checkbox(
@@ -110,6 +126,24 @@ pub fn show(
             ).on_hover_text("Tiles Roblox windows in a grid (2 = side-by-side, 4 = 2×2, etc.).");
 
             ui.add_space(4.0);
+        }
+
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut config.rename_roblox_windows,
+            "Name Roblox windows after their account",
+        ).on_hover_text(
+            "Renames each launched Roblox window to the account's alias, so tiled \
+             windows are tellable apart.\n\nOff by default. This writes to the Roblox \
+             window rather than just reading it, and how Hyperion treats that is not \
+             documented. It also changes what capture software matching on window \
+             title will find.",
+        );
+        if config.rename_roblox_windows && !config.anonymize_names {
+            ui.colored_label(
+                theme.text_muted,
+                "Window titles are readable by any program, and show up in screenshots and streams.",
+            );
         }
 
         ui.add_space(8.0);
@@ -151,6 +185,26 @@ pub fn show(
     });
     ui.add_space(6.0);
 
+    // ---- Developer options ----
+    section_frame.show(ui, |ui: &mut egui::Ui| {
+        ui.set_min_width(ui.available_width());
+        ui.strong("Developer Options");
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut config.developer_options,
+            "Show the Asset Manager tab",
+        ).on_hover_text(
+            "Upload assets to Roblox from any saved account, track moderation, and grant experiences permission to use them.",
+        );
+        if config.developer_options {
+            ui.colored_label(
+                theme.warning,
+                "\u{26a0} Uploads are permanent and public. Every asset is moderated under the account that uploaded it.",
+            );
+        }
+    });
+    ui.add_space(6.0);
+
     // ---- Roblox path override ----
     section_frame.show(ui, |ui: &mut egui::Ui| {
         ui.set_min_width(ui.available_width());
@@ -181,32 +235,53 @@ pub fn show(
     ui.separator();
     ui.add_space(8.0);
 
-    // ---- Master password management ----
+    // ---- Encryption ----
     section_frame.show(ui, |ui: &mut egui::Ui| {
         ui.set_min_width(ui.available_width());
-        ui.strong("Master Password");
-        ui.add_space(4.0);
-        if has_password {
-            ui.label("A master password is currently set.");
-        } else {
-            ui.colored_label(
-                egui::Color32::from_rgb(220, 160, 40),
-                "⚠ No master password set. Add an account to set one.",
-            );
-        }
+        ui.strong("Encryption");
         ui.add_space(4.0);
 
-        ui.label("New password:");
+        if has_password {
+            ui.label("Accounts are encrypted with your master password.");
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(
+                    "RM asks for it every time it starts. If you forget it, the accounts \
+                     cannot be recovered.",
+                )
+                .small()
+                .weak(),
+            );
+        } else {
+            ui.label("Accounts are encrypted and unlock automatically on this PC.");
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(
+                    "The key is held in Windows Credential Manager, so the file is useless \
+                     on its own. Anything running as you can still read it.",
+                )
+                .small()
+                .weak(),
+            );
+        }
+
+        ui.add_space(10.0);
+        ui.label(if has_password {
+            "Change your master password:"
+        } else {
+            "Require a master password at startup:"
+        });
+        ui.add_space(4.0);
+
         ui.add(
             egui::TextEdit::singleline(&mut settings_state.new_password_input)
                 .password(true)
-                .hint_text("Enter new password"),
+                .hint_text("New password"),
         );
-        ui.label("Confirm password:");
         ui.add(
             egui::TextEdit::singleline(&mut settings_state.confirm_password_input)
                 .password(true)
-                .hint_text("Confirm new password"),
+                .hint_text("Confirm password"),
         );
         ui.add_space(4.0);
 
@@ -218,22 +293,38 @@ pub fn show(
             && !passwords_match
         {
             ui.colored_label(
-                egui::Color32::from_rgb(200, 60, 60),
+                theme.danger,
                 "Passwords do not match.",
             );
         }
 
-        if ui
-            .add_enabled(passwords_match, egui::Button::new("🔑  Change Password"))
-            .clicked()
-        {
-            let new_pw = settings_state.new_password_input.clone();
-            settings_state.new_password_input.clear();
-            settings_state.confirm_password_input.clear();
-            action = Some(SettingsAction::ChangePassword {
-                new_password: new_pw,
-            });
-        }
+        ui.horizontal(|ui| {
+            let label = if has_password {
+                "🔑  Change password"
+            } else {
+                "🔑  Set password"
+            };
+            if ui
+                .add_enabled(passwords_match, egui::Button::new(label))
+                .clicked()
+            {
+                let new_pw = settings_state.new_password_input.clone();
+                settings_state.new_password_input.clear();
+                settings_state.confirm_password_input.clear();
+                action = Some(SettingsAction::ChangePassword {
+                    new_password: new_pw,
+                });
+            }
+
+            // Only offered to someone who has a password to remove. The store
+            // stays encrypted either way, so this is a convenience toggle
+            // rather than a way to turn encryption off.
+            if has_password && ui.button("Stop asking for a password").clicked() {
+                settings_state.new_password_input.clear();
+                settings_state.confirm_password_input.clear();
+                action = Some(SettingsAction::ClearPassword);
+            }
+        });
     });
 
     }); // ScrollArea

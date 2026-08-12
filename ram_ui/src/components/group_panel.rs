@@ -4,6 +4,8 @@
 use eframe::egui;
 use ram_core::models::{Account, LaunchPreset};
 
+use crate::theme::ThemeUi;
+
 /// Actions the group panel can request.
 pub enum GroupPanelAction {
     /// Launch all selected accounts into the given place/server.
@@ -51,7 +53,7 @@ pub fn show(
             .show(ui, |ui| {
                 for (idx, account) in selected_accounts.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        let dot = presence_color(account.last_presence.user_presence_type);
+                        let dot = ui.theme().presence(account.last_presence.user_presence_type);
                         let (dot_rect, _) =
                             ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
                         ui.painter().circle_filled(
@@ -80,26 +82,7 @@ pub fn show(
 
         // Preset quick-select chips (same set as the single-launch view).
         if !presets.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Presets:");
-                for (i, preset) in presets.iter().enumerate() {
-                    // push_id keeps each chip's click target distinct even
-                    // when multiple presets share a name.
-                    ui.push_id(i, |ui| {
-                        let btn = ui.small_button(&preset.name)
-                            .on_hover_text(match &preset.job_id {
-                                Some(j) if !j.is_empty() => {
-                                    format!("Place {}, Job {}", preset.place_id, j)
-                                }
-                                _ => format!("Place {}", preset.place_id),
-                            });
-                        if btn.clicked() {
-                            *place_id_input = preset.place_id.to_string();
-                            *job_id_input = preset.job_id.clone().unwrap_or_default();
-                        }
-                    });
-                }
-            });
+            super::preset_chips(ui, "Presets:", presets, place_id_input, job_id_input);
             ui.add_space(4.0);
         }
 
@@ -145,13 +128,4 @@ pub fn show(
     }); // ScrollArea
 
     action
-}
-
-fn presence_color(presence_type: u8) -> egui::Color32 {
-    match presence_type {
-        1 => egui::Color32::from_rgb(60, 180, 75),
-        2 => egui::Color32::from_rgb(30, 144, 255),
-        3 => egui::Color32::from_rgb(255, 165, 0),
-        _ => egui::Color32::from_rgb(130, 130, 130),
-    }
 }
