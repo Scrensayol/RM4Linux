@@ -23,50 +23,7 @@ use tracing::{debug, warn};
 
 use crate::error::CoreError;
 
-use std::sync::OnceLock;
-use serde_json::Value;
-
-const FALLBACK_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
-
-static DYNAMIC_USER_AGENT: OnceLock<String> = OnceLock::new();
-
-/// Returns the latest Windows Google Chrome User-Agent string, dynamically fetched
-/// from Google's Chrome version history API (with fallback if offline).
-pub fn get_user_agent() -> &'static str {
-    DYNAMIC_USER_AGENT.get_or_init(|| {
-        fetch_latest_chrome_user_agent().unwrap_or_else(|| {
-            FALLBACK_USER_AGENT.to_string()
-        })
-    })
-}
-
-fn fetch_latest_chrome_user_agent() -> Option<String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()?;
-
-    let resp = client
-        .get("https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/stable/versions")
-        .send()
-        .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    let json: Value = resp.json().ok()?;
-    let version = json["versions"].as_array()?.first()?["version"].as_str()?;
-    if !version.is_empty() {
-        let ua = format!(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
-        );
-        debug!("Dynamically resolved latest Windows Chrome User-Agent: {ua}");
-        return Some(ua);
-    }
-    None
-}
+const USER_AGENT: &str = "RM-Rust/0.1";
 const MAX_RETRIES: u32 = 6;
 const BASE_BACKOFF_MS: u64 = 1_000;
 /// Ceiling on one 429 backoff. Without it the doubling reaches half a minute by
@@ -168,7 +125,7 @@ impl RobloxClient {
     /// making authenticated requests.
     pub fn new() -> Result<Self, CoreError> {
         let client = Client::builder()
-            .user_agent(get_user_agent())
+            .user_agent(USER_AGENT)
             .timeout(REQUEST_TIMEOUT)
             .build()?;
         Ok(Self {

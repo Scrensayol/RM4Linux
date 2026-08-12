@@ -122,7 +122,6 @@ fn spawn_chromium_cmd(
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--password-store=basic")
-        .arg(format!("--user-agent={}", ram_core::auth::get_user_agent()))
         .arg(target_url);
 
     cmd.spawn()
@@ -552,7 +551,7 @@ fn download_ungoogled_chromium(target_path: &Path, status_file: Option<&Path>) -
     write_status(status_file, "Checking GitHub for latest Ungoogled Chromium release...");
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent("RM4Linux/1.91-linux (UngoogledChromiumDownloader)")
+        .user_agent("RM4Linux/1.9 (UngoogledChromiumDownloader)")
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| format!("http client build failed: {e}"))?;
