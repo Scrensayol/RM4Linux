@@ -2,7 +2,7 @@
 //!
 //! Spawns a genuine Ungoogled Chromium browser process with Chrome DevTools Protocol (CDP)
 //! enabled via `--remote-debugging-port`. Captures `.ROBLOSECURITY` session cookies via WebSocket
-//! CDP commands (`Network.getCookies` & `Storage.getCookies`) and profile disk scanning.
+//! CDP commands on the Browser Target (`Storage.getCookies`) and profile disk scanning.
 //!
 //! If no Ungoogled Chromium binary is present on the system, auto-downloads the latest
 //! release build from `ungoogled-software/ungoogled-chromium-portablelinux` into the app data directory.
@@ -25,7 +25,7 @@ pub const BROWSE_AS_FLAG: &str = "--browse-as";
 
 const LOGIN_URL: &str = "https://www.roblox.com/login";
 const BROWSE_AS_HOME_URL: &str = "https://www.roblox.com/home";
-const POLL_INTERVAL: Duration = Duration::from_millis(150);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub enum LoginOutcome {
     Status(String),
@@ -79,7 +79,7 @@ fn spawn_and_wait(profile_dir: PathBuf, tx: &Sender<LoginOutcome>) -> Result<Log
                 let _ = tx.send(LoginOutcome::Status(last_status.clone()));
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(30));
     }
 
     match std::fs::read_to_string(&outfile) {
@@ -122,6 +122,7 @@ fn spawn_chromium_cmd(
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--password-store=basic")
+        .arg(format!("--user-agent={}", ram_core::auth::get_user_agent()))
         .arg(target_url);
 
     cmd.spawn()
@@ -254,28 +255,18 @@ fn run_child_inner(
 
     write_status(status_file, "Connecting to browser CDP...");
     let ws_url = get_cdp_ws_url(port)?;
-    info!("Connected to CDP endpoint: {ws_url}");
+    info!("Connected to CDP browser target: {ws_url}");
 
     let (mut socket, _) =
         connect(ws_url.as_str()).map_err(|e| format!("websocket connect: {e}"))?;
 
     if let tungstenite::stream::MaybeTlsStream::Plain(ref s) = socket.get_ref() {
-        let _ = s.set_read_timeout(Some(Duration::from_millis(10)));
+        let _ = s.set_read_timeout(Some(Duration::from_millis(5)));
     }
 
-    // Enable Network, Page, and AutoAttach CDP domains
-    let enable_net = json!({
+    // Enable Target auto-attach across all browser contexts
+    let auto_attach = json!({
         "id": 1,
-        "method": "Network.enable",
-        "params": {}
-    });
-    let enable_page = json!({
-        "id": 2,
-        "method": "Page.enable",
-        "params": {}
-    });
-    let enable_target = json!({
-        "id": 3,
         "method": "Target.setAutoAttach",
         "params": {
             "autoAttach": true,
@@ -283,13 +274,11 @@ fn run_child_inner(
             "flatten": true
         }
     });
-    let _ = socket.send(tungstenite::Message::Text(enable_net.to_string().into()));
-    let _ = socket.send(tungstenite::Message::Text(enable_page.to_string().into()));
-    let _ = socket.send(tungstenite::Message::Text(enable_target.to_string().into()));
+    let _ = socket.send(tungstenite::Message::Text(auto_attach.to_string().into()));
 
     write_status(status_file, "Sign in to Roblox in Ungoogled Chromium.");
 
-    let mut msg_id = 4;
+    let mut msg_id = 2;
     let start = Instant::now();
     let timeout = Duration::from_secs(600);
 
@@ -312,22 +301,7 @@ fn run_child_inner(
             return Ok(());
         }
 
-        // 2. Query Network.getCookies and Storage.getCookies via CDP
-        let req_net = json!({
-            "id": msg_id,
-            "method": "Network.getCookies",
-            "params": {
-                "urls": [
-                    "https://www.roblox.com",
-                    "https://roblox.com",
-                    "https://auth.roblox.com",
-                    "https://web.roblox.com",
-                    "https://api.roblox.com"
-                ]
-            }
-        });
-        msg_id += 1;
-
+        // 2. Query Storage.getCookies on Browser Target (returns all profile cookies)
         let req_storage = json!({
             "id": msg_id,
             "method": "Storage.getCookies",
@@ -335,7 +309,6 @@ fn run_child_inner(
         });
         msg_id += 1;
 
-        let _ = socket.send(tungstenite::Message::Text(req_net.to_string().into()));
         let _ = socket.send(tungstenite::Message::Text(req_storage.to_string().into()));
 
         // 3. Process all incoming WebSocket frames continuously
@@ -345,7 +318,7 @@ fn run_child_inner(
 
                 // Direct text extraction scan (matches Set-Cookie header events, JSON, and network frames)
                 if let Some(cookie) = extract_cookie_from_text(text_str) {
-                    info!("Captured .ROBLOSECURITY cookie instantly from Ungoogled Chromium CDP stream!");
+                    info!("Captured .ROBLOSECURITY cookie instantly from Browser CDP stream!");
                     let _ = std::fs::write(&outfile, &cookie);
                     close_chromium(port, &mut child);
                     return Ok(());
@@ -359,7 +332,7 @@ fn run_child_inner(
                                 if let Some(val) = cookie["value"].as_str() {
                                     let trimmed = val.trim();
                                     if !trimmed.is_empty() {
-                                        info!("Captured .ROBLOSECURITY cookie from Ungoogled Chromium CDP JSON!");
+                                        info!("Captured .ROBLOSECURITY cookie from Browser CDP JSON!");
                                         let _ = std::fs::write(&outfile, trimmed);
                                         close_chromium(port, &mut child);
                                         return Ok(());
@@ -443,9 +416,13 @@ fn run_browse_as_inner(
 
     let mut child = spawn_chromium_cmd(&chromium_bin, &profile_dir, port, "about:blank")?;
 
-    let ws_url = get_cdp_ws_url(port)?;
+    let ws_url = get_cdp_page_ws_url(port)?;
     let (mut socket, _) =
         connect(ws_url.as_str()).map_err(|e| format!("websocket connect: {e}"))?;
+
+    if let tungstenite::stream::MaybeTlsStream::Plain(ref s) = socket.get_ref() {
+        let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    }
 
     let enable_req = json!({
         "id": 1,
@@ -468,6 +445,21 @@ fn run_browse_as_inner(
     });
     let _ = socket.send(tungstenite::Message::Text(set_cookie_req.to_string().into()));
 
+    // Wait for Network.setCookie response to guarantee cookie is registered before navigation
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Ok(msg) = socket.read() {
+            if let tungstenite::Message::Text(msg_text) = msg {
+                if let Ok(parsed) = serde_json::from_str::<Value>(msg_text.as_str()) {
+                    if parsed.get("id").and_then(|v| v.as_i64()) == Some(2) {
+                        info!("Network.setCookie acknowledged by CDP target");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     let nav_req = json!({
         "id": 3,
         "method": "Page.navigate",
@@ -476,6 +468,21 @@ fn run_browse_as_inner(
         }
     });
     let _ = socket.send(tungstenite::Message::Text(nav_req.to_string().into()));
+
+    // Wait for Page.navigate response
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Ok(msg) = socket.read() {
+            if let tungstenite::Message::Text(msg_text) = msg {
+                if let Ok(parsed) = serde_json::from_str::<Value>(msg_text.as_str()) {
+                    if parsed.get("id").and_then(|v| v.as_i64()) == Some(3) {
+                        info!("Page.navigate acknowledged by CDP target");
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     info!("Ungoogled Chromium launched as '{label}'. Waiting for exit...");
     let _ = child.wait();
@@ -545,7 +552,7 @@ fn download_ungoogled_chromium(target_path: &Path, status_file: Option<&Path>) -
     write_status(status_file, "Checking GitHub for latest Ungoogled Chromium release...");
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent("RM4Linux/1.9 (UngoogledChromiumDownloader)")
+        .user_agent("RM4Linux/1.91-linux (UngoogledChromiumDownloader)")
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| format!("http client build failed: {e}"))?;
@@ -663,36 +670,10 @@ fn get_cdp_ws_url(port: u16) -> Result<String, String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    let list_url = format!("http://127.0.0.1:{port}/json/list");
     let version_url = format!("http://127.0.0.1:{port}/json/version");
     let start = Instant::now();
 
     while start.elapsed() < Duration::from_secs(15) {
-        // Query /json/list for page target tab
-        if let Ok(resp) = client.get(&list_url).send() {
-            if let Ok(json) = resp.json::<Value>() {
-                if let Some(list) = json.as_array() {
-                    if let Some(target) = list.iter().find(|t| {
-                        t["type"].as_str() == Some("page")
-                            && t["url"]
-                                .as_str()
-                                .map(|u| u.to_lowercase().contains("roblox"))
-                                .unwrap_or(false)
-                    }) {
-                        if let Some(ws) = target["webSocketDebuggerUrl"].as_str() {
-                            return Ok(ws.to_string());
-                        }
-                    }
-                    if let Some(target) = list.iter().find(|t| t["type"].as_str() == Some("page")) {
-                        if let Some(ws) = target["webSocketDebuggerUrl"].as_str() {
-                            return Ok(ws.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fall back to /json/version browser target if list isn't ready
         if let Ok(resp) = client.get(&version_url).send() {
             if let Ok(json) = resp.json::<Value>() {
                 if let Some(ws) = json["webSocketDebuggerUrl"].as_str() {
@@ -700,7 +681,35 @@ fn get_cdp_ws_url(port: u16) -> Result<String, String> {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(30));
     }
-    Err(format!("Timed out waiting for CDP endpoint at {list_url}"))
+    Err(format!("Timed out waiting for CDP endpoint at {version_url}"))
+}
+
+fn get_cdp_page_ws_url(port: u16) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let list_url = format!("http://127.0.0.1:{port}/json/list");
+    let start = Instant::now();
+
+    while start.elapsed() < Duration::from_secs(15) {
+        if let Ok(resp) = client.get(&list_url).send() {
+            if let Ok(targets) = resp.json::<Value>() {
+                if let Some(arr) = targets.as_array() {
+                    for target in arr {
+                        if target["type"].as_str() == Some("page") {
+                            if let Some(ws) = target["webSocketDebuggerUrl"].as_str() {
+                                return Ok(ws.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err(format!("Timed out waiting for page CDP endpoint at {list_url}"))
 }

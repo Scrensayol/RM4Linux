@@ -1,6 +1,10 @@
 # Changelog
 
-## v1.9.0
+## v1.91-linux
+
+yea i done some bullshit
+
+## v1.90
 
 ### Added
 - **Right-click an account to kill or focus its client.** Killing used to be all or nothing. RM re-checks the process is really that account's client before it terminates anything.

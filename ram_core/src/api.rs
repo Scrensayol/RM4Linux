@@ -324,30 +324,24 @@ pub async fn resolve_share_link(
 }
 
 // ---------------------------------------------------------------------------
-// GitLab update check
+// GitHub update check (Scrensayol/RM4Linux)
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct ReleaseLinks {
-    #[serde(rename = "self")]
-    self_url: String,
-}
-
-#[derive(Deserialize)]
-struct GitLabRelease {
+struct GitHubRelease {
     tag_name: String,
-    _links: ReleaseLinks,
+    html_url: String,
 }
 
-/// Check for a newer release on GitLab. Returns `Some((version, url))` if an
+/// Check for a newer release on GitHub (Scrensayol/RM4Linux). Returns `Some((version, url))` if an
 /// update is available, `None` if already on the latest.
 pub async fn check_for_updates(current_version: &str) -> Result<Option<(String, String)>, CoreError> {
     let client = reqwest::Client::builder()
-        .user_agent("RM-update-check")
+        .user_agent("RM4Linux-update-check")
         .build()?;
 
-    let release: GitLabRelease = client
-        .get("https://gitlab.com/api/v4/projects/centerepic%2Frobloxmanager/releases/permalink/latest")
+    let release: GitHubRelease = client
+        .get("https://api.github.com/repos/Scrensayol/RM4Linux/releases/latest")
         .send()
         .await?
         .json()
@@ -357,7 +351,7 @@ pub async fn check_for_updates(current_version: &str) -> Result<Option<(String, 
     let local = current_version.trim_start_matches('v');
 
     if remote != local {
-        Ok(Some((remote.to_string(), release._links.self_url)))
+        Ok(Some((remote.to_string(), release.html_url)))
     } else {
         Ok(None)
     }

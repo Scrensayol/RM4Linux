@@ -16,10 +16,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+#[cfg(windows)]
+use tracing::warn;
 
 use crate::error::CoreError;
 use crate::instances::{classify_cmdline, LiveClient};
+
 
 // ---------------------------------------------------------------------------
 // Privacy — clear Roblox cookie tracking file

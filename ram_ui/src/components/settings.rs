@@ -119,32 +119,25 @@ pub fn show(
             );
         }
 
-            ui.add_space(4.0);
-            ui.checkbox(
+        ui.add_space(4.0);
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(
                 &mut config.auto_arrange_windows,
                 "Auto-arrange Roblox windows after launch",
-            ).on_hover_text("Tiles Roblox windows in a grid (2 = side-by-side, 4 = 2×2, etc.).");
-
-            ui.add_space(4.0);
-
+            ),
+        )
+        .on_disabled_hover_text("can't be arsed to port these features to linux, maybe later in the future");
 
         ui.add_space(4.0);
-        ui.checkbox(
-            &mut config.rename_roblox_windows,
-            "Name Roblox windows after their account",
-        ).on_hover_text(
-            "Renames each launched Roblox window to the account's alias, so tiled \
-             windows are tellable apart.\n\nOff by default. This writes to the Roblox \
-             window rather than just reading it, and how Hyperion treats that is not \
-             documented. It also changes what capture software matching on window \
-             title will find.",
-        );
-        if config.rename_roblox_windows && !config.anonymize_names {
-            ui.colored_label(
-                theme.text_muted,
-                "Window titles are readable by any program, and show up in screenshots and streams.",
-            );
-        }
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(
+                &mut config.rename_roblox_windows,
+                "Name Roblox windows after their account",
+            ),
+        )
+        .on_disabled_hover_text("can't be arsed to port these features to linux, maybe later in the future");
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
