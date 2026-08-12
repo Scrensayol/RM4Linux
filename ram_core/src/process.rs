@@ -366,10 +366,6 @@ impl LaunchTokenCache {
     }
 }
 
-#[cfg(not(windows))]
-pub fn is_roblox_running() -> bool {
-    roblox_instance_count() > 0
-}
 
 /// Count how many Roblox player instances are running.
 #[cfg(windows)]
@@ -607,8 +603,16 @@ pub fn kill_tray_roblox() -> usize {
 ///   all read via ReadProcessMemory.
 ///
 /// Works without admin privileges for same-user processes.
+#[cfg(not(windows))]
+fn native_get_cmdline(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|s| s.replace('\0', " "))
+}
+
 #[cfg(windows)]
 fn native_get_cmdline(pid: u32) -> Option<String> {
+
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
@@ -1493,4 +1497,4 @@ mod tests {
         assert!(scrubbed.contains("placeId%3D606"), "{scrubbed}");
     }
 }
->>>>>>> upstream/main
+

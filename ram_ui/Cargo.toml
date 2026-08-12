@@ -16,7 +16,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 uuid = { workspace = true }
+reqwest = { workspace = true }
+tungstenite = { workspace = true }
+url = { workspace = true }
 chrono = "0.4"
+
+
 
 eframe = "0.30"
 egui_extras = { version = "0.30", features = ["image", "http"] }

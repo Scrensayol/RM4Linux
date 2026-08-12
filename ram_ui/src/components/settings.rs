@@ -126,7 +126,7 @@ pub fn show(
             ).on_hover_text("Tiles Roblox windows in a grid (2 = side-by-side, 4 = 2×2, etc.).");
 
             ui.add_space(4.0);
-        }
+
 
         ui.add_space(4.0);
         ui.checkbox(

@@ -673,12 +673,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Turn a file path into a default `displayName`: stem only, whitespace
 /// collapsed, clamped to [`MAX_DISPLAY_NAME_CHARS`].
 pub fn sanitize_display_name_from_path(path: &Path) -> String {
-    let stem = path
+    let raw_str = path.to_string_lossy();
+    let normalized = raw_str.replace('\\', "/");
+    let norm_path = Path::new(&normalized);
+    let stem = norm_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     sanitize_display_name(stem)
 }
+
 
 /// Clean a user-entered or path-derived display name.
 pub fn sanitize_display_name(raw: &str) -> String {

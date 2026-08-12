@@ -262,9 +262,11 @@ fn main() {
     if args.len() >= 4 && args[1] == browser_login::FLAG {
         let profile_dir = PathBuf::from(&args[2]);
         let outfile = PathBuf::from(&args[3]);
-        let code = browser_login::run_child(profile_dir, outfile);
+        let status_file = args.get(4).map(PathBuf::from);
+        let code = browser_login::run_child(profile_dir, outfile, status_file);
         std::process::exit(code);
     }
+
     // "Open browser as" child mode — same re-exec trick, but pre-loaded with
     // an account's cookie and left open until the user closes the window.
     if args.len() >= 4 && args[1] == browser_login::BROWSE_AS_FLAG {

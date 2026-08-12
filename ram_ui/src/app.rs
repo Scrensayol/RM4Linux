@@ -182,6 +182,9 @@ struct AddAccountDialog {
     browser_login_pending: bool,
     /// Receiver for the outcome of the embedded login window, if one is active.
     browser_login_rx: Option<std::sync::mpsc::Receiver<crate::browser_login::LoginOutcome>>,
+    /// Status message during browser download or startup.
+    browser_status: String,
+
     /// Set when validation succeeded but the account is currently under
     /// moderation. The store push is deferred until the user explicitly
     /// chooses to add anyway (or cancels). Box keeps the dialog struct small.
@@ -3869,7 +3872,11 @@ impl AppState {
         // Poll the embedded-login receiver for a completed outcome.
         if let Some(rx) = &self.add_dialog.browser_login_rx {
             match rx.try_recv() {
+                Ok(crate::browser_login::LoginOutcome::Status(msg)) => {
+                    self.add_dialog.browser_status = msg;
+                }
                 Ok(crate::browser_login::LoginOutcome::Success(cookie)) => {
+
                     self.add_dialog.cookie_input = cookie;
                     self.add_dialog.browser_login_pending = false;
                     self.add_dialog.browser_login_rx = None;
@@ -4205,7 +4212,12 @@ impl AppState {
                         if self.add_dialog.browser_login_pending {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label("Sign in to Roblox in the opened window.");
+                                let status_text = if self.add_dialog.browser_status.is_empty() {
+                                    "Sign in to Roblox in Ungoogled Chromium."
+                                } else {
+                                    &self.add_dialog.browser_status
+                                };
+                                ui.label(status_text);
                             });
                         } else if !self.add_dialog.cookie_input.is_empty() {
                             ui.label(
@@ -4222,9 +4234,11 @@ impl AppState {
                                 crate::browser_login::spawn(profile_dir, tx);
                                 self.add_dialog.browser_login_rx = Some(rx);
                                 self.add_dialog.browser_login_pending = true;
+                                self.add_dialog.browser_status.clear();
                                 self.add_dialog.last_error = None;
                             }
                         }
+
                         ui.add_space(8.0);
                     }
 

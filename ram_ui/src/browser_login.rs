@@ -1,52 +1,34 @@
-//! Subprocess-based browser login to Roblox.
+//! Subprocess-based browser login to Roblox using Ungoogled Chromium.
 //!
-//! `wry` + `tao` don't coexist with `eframe`'s main-thread `winit` event loop
-//! in the same process — even with `EventLoopBuilderExtWindows::with_any_thread`,
-//! `WindowBuilder::build` dies with a native Win32 exception when there's
-//! already a winit-owned window pump elsewhere in the process. Workaround:
-//! re-exec our own binary with a hidden flag so the child has a genuine main
-//! thread to host the webview on. The child writes the captured cookie to a
-//! file we hand it, then exits; the parent waits on the child and reads that
-//! file to produce a [`LoginOutcome`].
+//! Spawns a genuine Ungoogled Chromium browser process with Chrome DevTools Protocol (CDP)
+//! enabled via `--remote-debugging-port`. Captures `.ROBLOSECURITY` session cookies via WebSocket
+//! CDP commands (`Network.getCookies` & `Storage.getCookies`) and profile disk scanning.
 //!
-//! The wire format is trivially simple: the outfile only exists on success and
-//! contains the raw `.ROBLOSECURITY` value. Anything else (missing file, empty
-//! file, child exit != 0) is treated as cancel/failure.
-//!
-//! `main()` dispatches the child mode via [`FLAG`] before `eframe::run_native`
-//! so the normal UI never initializes in the child process.
+//! If no Ungoogled Chromium binary is present on the system, auto-downloads the latest
+//! release build from `ungoogled-software/ungoogled-chromium-portablelinux` into the app data directory.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tao::window::WindowBuilder;
+use serde_json::{json, Value};
 use tracing::{info, warn};
-use wry::{WebContext, WebViewBuilder};
+use tungstenite::connect;
 
-/// CLI flag that switches `main()` into child webview mode.
-/// Invoked as: `ram_ui.exe --browser-login <profile_dir> <outfile>`.
+/// CLI flag that switches `main()` into child browser login mode.
+/// Invoked as: `ram_ui --browser-login <profile_dir> <outfile> [statusfile]`.
 pub const FLAG: &str = "--browser-login";
 
 /// CLI flag for the "Open browser as <account>" child mode.
-/// Invoked as: `ram_ui.exe --browse-as <profile_dir> <cookie_file>`.
+/// Invoked as: `ram_ui --browse-as <profile_dir> <cookie_file> <label>`.
 pub const BROWSE_AS_FLAG: &str = "--browse-as";
 
 const LOGIN_URL: &str = "https://www.roblox.com/login";
-/// First page the browse-as child navigates to. Picked so it's small and
-/// always loads — its only purpose is to give us a roblox.com origin from
-/// which to install the auth cookie via `document.cookie`. The init script
-/// then immediately redirects away before the login form renders.
-const BROWSE_AS_BOOT_URL: &str = "https://www.roblox.com/login";
-/// Path component of [`BROWSE_AS_BOOT_URL`] — used by the init script to
-/// detect the bootstrap navigation and skip the redirect on subsequent ones.
-const BROWSE_AS_BOOT_PATH: &str = "/login";
 const BROWSE_AS_HOME_URL: &str = "https://www.roblox.com/home";
-const POLL_INTERVAL: Duration = Duration::from_millis(400);
+const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 pub enum LoginOutcome {
+    Status(String),
     Success(String),
     Cancelled,
     Failed(String),
@@ -58,7 +40,7 @@ pub enum LoginOutcome {
 
 pub fn spawn(profile_dir: PathBuf, tx: Sender<LoginOutcome>) {
     std::thread::spawn(move || {
-        let outcome = match spawn_and_wait(profile_dir) {
+        let outcome = match spawn_and_wait(profile_dir, &tx) {
             Ok(o) => o,
             Err(e) => {
                 warn!("browser_login parent: {e}");
@@ -69,42 +51,175 @@ pub fn spawn(profile_dir: PathBuf, tx: Sender<LoginOutcome>) {
     });
 }
 
-fn spawn_and_wait(profile_dir: PathBuf) -> Result<LoginOutcome, String> {
+fn spawn_and_wait(profile_dir: PathBuf, tx: &Sender<LoginOutcome>) -> Result<LoginOutcome, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let outfile = profile_dir.join("cookie.out");
+    let status_file = profile_dir.join("status.out");
+
     // Clear any leftover from a prior attempt so `exists()` means "this run"
     let _ = std::fs::remove_file(&outfile);
+    let _ = std::fs::remove_file(&status_file);
 
     info!("browser_login parent: spawning child {}", exe.display());
-    let status = std::process::Command::new(&exe)
+    let mut child = std::process::Command::new(&exe)
         .arg(FLAG)
         .arg(&profile_dir)
         .arg(&outfile)
-        .status()
+        .arg(&status_file)
+        .spawn()
         .map_err(|e| format!("spawn child: {e}"))?;
 
-    if !status.success() {
-        return Err(format!("child exited unsuccessfully: {status}"));
+    let mut last_status = String::new();
+
+    while child.try_wait().map_err(|e| format!("try_wait: {e}"))?.is_none() {
+        if let Ok(st) = std::fs::read_to_string(&status_file) {
+            let st_trimmed = st.trim();
+            if !st_trimmed.is_empty() && st_trimmed != last_status {
+                last_status = st_trimmed.to_string();
+                let _ = tx.send(LoginOutcome::Status(last_status.clone()));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     match std::fs::read_to_string(&outfile) {
         Ok(cookie) if !cookie.trim().is_empty() => {
             let cookie = cookie.trim().to_string();
             let _ = std::fs::remove_file(&outfile);
+            let _ = std::fs::remove_file(&status_file);
             Ok(LoginOutcome::Success(cookie))
         }
-        _ => Ok(LoginOutcome::Cancelled),
+        _ => {
+            let _ = std::fs::remove_file(&status_file);
+            Ok(LoginOutcome::Cancelled)
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Child side — runs on this process's main thread, hosts the webview, exits.
+// Helper — status file writer & Chromium launcher
 // ---------------------------------------------------------------------------
 
-/// Entry point for the child process. Blocks until the user logs in or closes
-/// the window, then returns an exit code for `std::process::exit`.
-pub fn run_child(profile_dir: PathBuf, outfile: PathBuf) -> i32 {
-    match run_child_inner(profile_dir, outfile) {
+fn write_status(status_file: Option<&Path>, msg: &str) {
+    if let Some(sf) = status_file {
+        let _ = std::fs::write(sf, msg);
+    }
+}
+
+fn spawn_chromium_cmd(
+    chromium_bin: &Path,
+    profile_dir: &Path,
+    port: u16,
+    target_url: &str,
+) -> Result<std::process::Child, String> {
+    let mut cmd = std::process::Command::new(chromium_bin);
+    let bin_str = chromium_bin.to_string_lossy().to_lowercase();
+    if bin_str.contains("appimage") {
+        cmd.arg("--appimage-extract-and-run");
+    }
+    cmd.arg(format!("--remote-debugging-port={port}"))
+        .arg(format!("--user-data-dir={}", profile_dir.display()))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--password-store=basic")
+        .arg(target_url);
+
+    cmd.spawn()
+        .map_err(|e| format!("failed to spawn ungoogled-chromium process: {e}"))
+}
+
+/// Fallback disk scanner for Chromium SQLite Cookies & Cookies-wal files
+fn check_disk_cookie(profile_dir: &Path) -> Option<String> {
+    let candidates = [
+        profile_dir.join("Default").join("Network").join("Cookies"),
+        profile_dir.join("Default").join("Network").join("Cookies-wal"),
+        profile_dir.join("Network").join("Cookies"),
+        profile_dir.join("Network").join("Cookies-wal"),
+        profile_dir.join("Default").join("Cookies"),
+        profile_dir.join("Default").join("Cookies-wal"),
+        profile_dir.join("Cookies"),
+        profile_dir.join("Cookies-wal"),
+    ];
+    for cookie_file in candidates {
+        if !cookie_file.exists() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&cookie_file) else {
+            continue;
+        };
+        let content = String::from_utf8_lossy(&bytes);
+        if let Some(pos) = content.find("_|WARNING:-DO-NOT-SHARE-THIS!") {
+            let rest = &content[pos..];
+            let end = rest
+                .find(|c: char| c.is_ascii_whitespace() || c == ';' || c == '"' || c == '\'' || c == '\\' || c == '\0')
+                .unwrap_or(rest.len());
+            let cookie = rest[..end].trim().to_string();
+            if cookie.len() > 50 {
+                return Some(cookie);
+            }
+        }
+    }
+    None
+}
+
+/// Extracts .ROBLOSECURITY token string from raw text (e.g. WebSocket frame or JSON)
+fn extract_cookie_from_text(text: &str) -> Option<String> {
+    if let Some(pos) = text.find("_|WARNING:-DO-NOT-SHARE-THIS!") {
+        let rest = &text[pos..];
+        let end = rest
+            .find(|c: char| c.is_ascii_whitespace() || c == ';' || c == '"' || c == '\'' || c == '\\' || c == '\0')
+            .unwrap_or(rest.len());
+        let cookie = rest[..end].trim().to_string();
+        if cookie.len() > 50 {
+            return Some(cookie);
+        }
+    }
+    None
+}
+
+fn close_chromium(port: u16, child: &mut std::process::Child) {
+    info!("Closing Ungoogled Chromium session on port {port}");
+
+    let version_url = format!("http://127.0.0.1:{port}/json/version");
+    if let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    {
+        if let Ok(resp) = client.get(&version_url).send() {
+            if let Ok(json) = resp.json::<Value>() {
+                if let Some(ws_url) = json["webSocketDebuggerUrl"].as_str() {
+                    if let Ok((mut socket, _)) = connect(ws_url) {
+                        let close_req = json!({
+                            "id": 9999,
+                            "method": "Browser.close",
+                            "params": {}
+                        });
+                        let _ = socket.send(tungstenite::Message::Text(close_req.to_string().into()));
+                    }
+                }
+            }
+        }
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(1000) {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// ---------------------------------------------------------------------------
+// Child side — runs Ungoogled Chromium, queries CDP for auth cookie, exits.
+// ---------------------------------------------------------------------------
+
+/// Entry point for the child login process.
+pub fn run_child(profile_dir: PathBuf, outfile: PathBuf, status_file: Option<PathBuf>) -> i32 {
+    match run_child_inner(profile_dir, outfile, status_file.as_deref()) {
         Ok(()) => 0,
         Err(e) => {
             warn!("browser_login child: {e}");
@@ -113,228 +228,167 @@ pub fn run_child(profile_dir: PathBuf, outfile: PathBuf) -> i32 {
     }
 }
 
-fn run_child_inner(profile_dir: PathBuf, outfile: PathBuf) -> Result<(), String> {
-    info!("browser_login child: start, profile={}, out={}", profile_dir.display(), outfile.display());
-    std::fs::create_dir_all(&profile_dir)
-        .map_err(|e| format!("create profile dir: {e}"))?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(&profile_dir) {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o755);
-            let _ = std::fs::set_permissions(&profile_dir, permissions);
-        }
+fn run_child_inner(
+    profile_dir: PathBuf,
+    outfile: PathBuf,
+    status_file: Option<&Path>,
+) -> Result<(), String> {
+    info!(
+        "browser_login child: start, profile={}, out={}",
+        profile_dir.display(),
+        outfile.display()
+    );
+    std::fs::create_dir_all(&profile_dir).map_err(|e| format!("create profile dir: {e}"))?;
+
+    let chromium_bin = find_or_download_chromium(status_file)?;
+    let port = get_free_port();
+
+    info!(
+        "Spawning Ungoogled Chromium ({}) on remote debugging port {}",
+        chromium_bin.display(),
+        port
+    );
+
+    write_status(status_file, "Starting Ungoogled Chromium...");
+    let mut child = spawn_chromium_cmd(&chromium_bin, &profile_dir, port, LOGIN_URL)?;
+
+    write_status(status_file, "Connecting to browser CDP...");
+    let ws_url = get_cdp_ws_url(port)?;
+    info!("Connected to CDP endpoint: {ws_url}");
+
+    let (mut socket, _) =
+        connect(ws_url.as_str()).map_err(|e| format!("websocket connect: {e}"))?;
+
+    if let tungstenite::stream::MaybeTlsStream::Plain(ref s) = socket.get_ref() {
+        let _ = s.set_read_timeout(Some(Duration::from_millis(10)));
     }
 
-    let event_loop = EventLoopBuilder::<()>::new().build();
+    // Enable Network, Page, and AutoAttach CDP domains
+    let enable_net = json!({
+        "id": 1,
+        "method": "Network.enable",
+        "params": {}
+    });
+    let enable_page = json!({
+        "id": 2,
+        "method": "Page.enable",
+        "params": {}
+    });
+    let enable_target = json!({
+        "id": 3,
+        "method": "Target.setAutoAttach",
+        "params": {
+            "autoAttach": true,
+            "waitForDebuggerOnStart": false,
+            "flatten": true
+        }
+    });
+    let _ = socket.send(tungstenite::Message::Text(enable_net.to_string().into()));
+    let _ = socket.send(tungstenite::Message::Text(enable_page.to_string().into()));
+    let _ = socket.send(tungstenite::Message::Text(enable_target.to_string().into()));
 
-    let window = WindowBuilder::new()
-        .with_title("Log in to Roblox")
-        .with_inner_size(tao::dpi::LogicalSize::new(500.0, 720.0))
-        .build(&event_loop)
-        .map_err(|e| format!("window build: {e}"))?;
+    write_status(status_file, "Sign in to Roblox in Ungoogled Chromium.");
 
-    let mut web_context = WebContext::new(Some(profile_dir));
+    let mut msg_id = 4;
+    let start = Instant::now();
+    let timeout = Duration::from_secs(600);
 
-    let webgl_script = r#"(function() {
-        // 1. Mask the WebGL Renderer (Disguise Mesa Linux drivers as standard NVIDIA Windows/Linux specs)
-        try {
-            const orgGetParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(param) {
-                if (param === 37445) return 'NVIDIA Corporation'; // UNMASKED_VENDOR_WEBGL
-                if (param === 37446) return 'NVIDIA GeForce RTX 4060/PCIe/SSE2'; // UNMASKED_RENDERER_WEBGL
-                return orgGetParameter.apply(this, arguments);
-            };
-            if (typeof WebGL2RenderingContext !== 'undefined') {
-                const orgGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
-                WebGL2RenderingContext.prototype.getParameter = function(param) {
-                    if (param === 37445) return 'NVIDIA Corporation'; // UNMASKED_VENDOR_WEBGL
-                    if (param === 37446) return 'NVIDIA GeForce RTX 4060/PCIe/SSE2'; // UNMASKED_RENDERER_WEBGL
-                    return orgGetParameter2.apply(this, arguments);
-                };
+    while start.elapsed() < timeout {
+        if let Ok(Some(status)) = child.try_wait() {
+            info!("Ungoogled Chromium exited with status: {status}");
+            if let Some(cookie) = check_disk_cookie(&profile_dir) {
+                info!("Captured .ROBLOSECURITY cookie from profile disk after browser exit!");
+                let _ = std::fs::write(&outfile, &cookie);
+                return Ok(());
             }
-        } catch(e) {}
+            break;
+        }
 
-        // 2. Hide Automation Flags
-        try {
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        } catch(e) {}
+        // 1. Instant check on disk cookies (SQLite + WAL)
+        if let Some(cookie) = check_disk_cookie(&profile_dir) {
+            info!("Captured .ROBLOSECURITY cookie from profile disk!");
+            let _ = std::fs::write(&outfile, &cookie);
+            close_chromium(port, &mut child);
+            return Ok(());
+        }
 
-        // 3. Normalize Language Arrays
-        try {
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        } catch(e) {}
-
-        // 4. Fabricate Realistic Screen Boundaries (Prevents Webview Box detection)
-        try {
-            Object.defineProperty(Screen.prototype, 'width', { get: () => 1920 });
-            Object.defineProperty(Screen.prototype, 'height', { get: () => 1080 });
-            Object.defineProperty(Screen.prototype, 'colorDepth', { get: () => 24 });
-            Object.defineProperty(Screen.prototype, 'pixelDepth', { get: () => 24 });
-        } catch(e) {}
-
-        // 5. Fabricate the missing window.chrome object structure
-        try {
-            window.chrome = {
-                app: {
-                    isInstalled: false,
-                    InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
-                    RunningState: { CAN_RUN: 'can_run', CANNOT_RUN: 'cannot_run', RUNNING: 'running' }
-                },
-                runtime: {
-                    OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
-                    OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
-                    PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-                    PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
-                    PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
-                    RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }
-                }
-            };
-        } catch(e) {}
-
-        // 6. Mock a genuine Chrome Plugin ecosystem
-        try {
-            const mockPlugins = [
-                { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
-                { name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" },
-                { name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }
-            ];
-
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => {
-                    const proto = Object.create(PluginArray.prototype);
-                    mockPlugins.forEach((p, i) => {
-                        const pl = Object.create(Plugin.prototype);
-                        Object.defineProperties(pl, {
-                            name: { get: () => p.name },
-                            filename: { get: () => p.filename },
-                            description: { get: () => p.description }
-                        });
-                        proto[i] = pl;
-                        proto[p.name] = pl;
-                    });
-                    Object.defineProperty(proto, 'length', { get: () => mockPlugins.length });
-                    return proto;
-                }
-            });
-        } catch(e) {}
-
-        // 7. Fake typical Permissions API properties
-        try {
-            const originalQuery = navigator.permissions.query;
-            navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({ state: Notification.permission, onchange: null }) :
-                    originalQuery(parameters)
-            );
-        } catch(e) {}
-    })();"#;
-
-    let builder = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_url(LOGIN_URL)
-        .with_user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
-        .with_initialization_script(webgl_script)
-        .with_navigation_handler(|url| {
-            if url.starts_with("roblox-player:") {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&url)
-                    .spawn();
-                false
-            } else {
-                true
+        // 2. Query Network.getCookies and Storage.getCookies via CDP
+        let req_net = json!({
+            "id": msg_id,
+            "method": "Network.getCookies",
+            "params": {
+                "urls": [
+                    "https://www.roblox.com",
+                    "https://roblox.com",
+                    "https://auth.roblox.com",
+                    "https://web.roblox.com",
+                    "https://api.roblox.com"
+                ]
             }
         });
+        msg_id += 1;
 
-    #[cfg(target_os = "linux")]
-    let webview = {
-        use tao::platform::unix::WindowExtUnix;
-        use wry::WebViewBuilderExtUnix;
-        use wry::WebViewExtUnix;
-        use gtk::prelude::*;
-        use webkit2gtk::{WebViewExt, WebContextExt, CookieManagerExt};
-        let vbox = window.default_vbox()
-            .ok_or_else(|| "Failed to get default vbox from window".to_string())?;
-        let wv = builder.build_gtk(vbox)
-            .map_err(|e| format!("webview build: {e}"))?;
-        
-        // Explicitly set cookie policy to Always Allow so session states are preserved
-        if let Some(context) = wv.webview().context() {
-            if let Some(cookie_manager) = context.cookie_manager() {
-                cookie_manager.set_accept_policy(webkit2gtk::CookieAcceptPolicy::Always);
-            }
-        }
-        
-        wv.webview().show();
-        wv
-    };
+        let req_storage = json!({
+            "id": msg_id,
+            "method": "Storage.getCookies",
+            "params": {}
+        });
+        msg_id += 1;
 
-    #[cfg(not(target_os = "linux"))]
-    let webview = builder.build(&window)
-        .map_err(|e| format!("webview build: {e}"))?;
+        let _ = socket.send(tungstenite::Message::Text(req_net.to_string().into()));
+        let _ = socket.send(tungstenite::Message::Text(req_storage.to_string().into()));
 
-    info!("browser_login child: entering event loop");
-    let mut next_poll = Instant::now() + POLL_INTERVAL;
-    let mut done = false;
+        // 3. Process all incoming WebSocket frames continuously
+        while let Ok(msg) = socket.read() {
+            if let tungstenite::Message::Text(msg_text) = msg {
+                let text_str = msg_text.as_str();
 
-    // `run` diverges (`-> !`) — the process exits when we request
-    // ControlFlow::Exit, so there's no code after this point.
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(next_poll);
+                // Direct text extraction scan (matches Set-Cookie header events, JSON, and network frames)
+                if let Some(cookie) = extract_cookie_from_text(text_str) {
+                    info!("Captured .ROBLOSECURITY cookie instantly from Ungoogled Chromium CDP stream!");
+                    let _ = std::fs::write(&outfile, &cookie);
+                    close_chromium(port, &mut child);
+                    return Ok(());
+                }
 
-        match event {
-            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-                if !done {
-                    if let Some(cookie) = try_extract_cookie(&webview) {
-                        info!("browser_login child: cookie captured, writing outfile");
-                        if let Err(e) = std::fs::write(&outfile, &cookie) {
-                            warn!("failed to write cookie outfile: {e}");
+                // Structured JSON scan
+                if let Ok(parsed) = serde_json::from_str::<Value>(text_str) {
+                    if let Some(cookies) = parsed["result"]["cookies"].as_array() {
+                        for cookie in cookies {
+                            if cookie["name"].as_str() == Some(".ROBLOSECURITY") {
+                                if let Some(val) = cookie["value"].as_str() {
+                                    let trimmed = val.trim();
+                                    if !trimmed.is_empty() {
+                                        info!("Captured .ROBLOSECURITY cookie from Ungoogled Chromium CDP JSON!");
+                                        let _ = std::fs::write(&outfile, trimmed);
+                                        close_chromium(port, &mut child);
+                                        return Ok(());
+                                    }
+                                }
+                            }
                         }
-                        done = true;
-                        *control_flow = ControlFlow::Exit;
-                        return;
+                    }
+                    if parsed.get("id").is_some() {
+                        break;
                     }
                 }
-                next_poll = Instant::now() + POLL_INTERVAL;
             }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                *control_flow = ControlFlow::Exit;
-            }
-            _ => {}
         }
-    })
-}
 
-fn try_extract_cookie(webview: &wry::WebView) -> Option<String> {
-    let cookies = webview.cookies().ok()?;
-    cookies.into_iter().find_map(|c| {
-        if c.name() == ".ROBLOSECURITY" && !c.value().is_empty() {
-            Some(c.value().to_string())
-        } else {
-            None
-        }
-    })
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    close_chromium(port, &mut child);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// "Open browser as" — fire-and-forget child window pre-loaded with an
-// account's cookie. Unlike the login flow there's no value to return: the
-// parent spawns it detached and the user closes the window when done.
+// "Open browser as" — spawn Ungoogled Chromium pre-authenticated via CDP
 // ---------------------------------------------------------------------------
 
-/// Parent-side: spawn a detached child window logged in as the given cookie.
-/// The cookie is handed over via a one-shot file inside `profile_dir`; the
-/// child deletes that file as its first action so the secret never lives on
-/// disk longer than the spawn race. `label` is the username (or anon tag)
-/// shown in the window title.
 pub fn spawn_browse_as(profile_dir: PathBuf, cookie: String, label: String) -> Result<(), String> {
-    std::fs::create_dir_all(&profile_dir)
-        .map_err(|e| format!("create profile dir: {e}"))?;
+    std::fs::create_dir_all(&profile_dir).map_err(|e| format!("create profile dir: {e}"))?;
     let cookie_in = profile_dir.join("cookie.in");
-    // Clear any leftover from a previous failed spawn before writing fresh.
     let _ = std::fs::remove_file(&cookie_in);
     std::fs::write(&cookie_in, cookie.as_bytes())
         .map_err(|e| format!("write cookie file: {e}"))?;
@@ -351,14 +405,12 @@ pub fn spawn_browse_as(profile_dir: PathBuf, cookie: String, label: String) -> R
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| {
-            // Best-effort cleanup if the spawn itself failed
             let _ = std::fs::remove_file(&cookie_in);
             format!("spawn child: {e}")
         })?;
     Ok(())
 }
 
-/// Entry point for the browse-as child. Returns an exit code for `std::process::exit`.
 pub fn run_browse_as_child(profile_dir: PathBuf, cookie_in: PathBuf, label: String) -> i32 {
     match run_browse_as_inner(profile_dir, cookie_in, label) {
         Ok(()) => 0,
@@ -369,224 +421,286 @@ pub fn run_browse_as_child(profile_dir: PathBuf, cookie_in: PathBuf, label: Stri
     }
 }
 
-fn run_browse_as_inner(profile_dir: PathBuf, cookie_in: PathBuf, label: String) -> Result<(), String> {
+fn run_browse_as_inner(
+    profile_dir: PathBuf,
+    cookie_in: PathBuf,
+    label: String,
+) -> Result<(), String> {
     info!("browse_as child: start, profile={}", profile_dir.display());
 
-    // Read and immediately delete the cookie hand-off file.
-    let cookie_value = std::fs::read_to_string(&cookie_in)
-        .map_err(|e| format!("read cookie file: {e}"))?;
+    let cookie_value =
+        std::fs::read_to_string(&cookie_in).map_err(|e| format!("read cookie file: {e}"))?;
     let _ = std::fs::remove_file(&cookie_in);
     let cookie_value = cookie_value.trim().to_string();
     if cookie_value.is_empty() {
         return Err("empty cookie hand-off".into());
     }
 
-    std::fs::create_dir_all(&profile_dir)
-        .map_err(|e| format!("create profile dir: {e}"))?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(&profile_dir) {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o755);
-            let _ = std::fs::set_permissions(&profile_dir, permissions);
+    std::fs::create_dir_all(&profile_dir).map_err(|e| format!("create profile dir: {e}"))?;
+
+    let chromium_bin = find_or_download_chromium(None)?;
+    let port = get_free_port();
+
+    let mut child = spawn_chromium_cmd(&chromium_bin, &profile_dir, port, "about:blank")?;
+
+    let ws_url = get_cdp_ws_url(port)?;
+    let (mut socket, _) =
+        connect(ws_url.as_str()).map_err(|e| format!("websocket connect: {e}"))?;
+
+    let enable_req = json!({
+        "id": 1,
+        "method": "Network.enable",
+        "params": {}
+    });
+    let _ = socket.send(tungstenite::Message::Text(enable_req.to_string().into()));
+
+    let set_cookie_req = json!({
+        "id": 2,
+        "method": "Network.setCookie",
+        "params": {
+            "name": ".ROBLOSECURITY",
+            "value": cookie_value,
+            "domain": ".roblox.com",
+            "path": "/",
+            "secure": true,
+            "httpOnly": true
+        }
+    });
+    let _ = socket.send(tungstenite::Message::Text(set_cookie_req.to_string().into()));
+
+    let nav_req = json!({
+        "id": 3,
+        "method": "Page.navigate",
+        "params": {
+            "url": BROWSE_AS_HOME_URL
+        }
+    });
+    let _ = socket.send(tungstenite::Message::Text(nav_req.to_string().into()));
+
+    info!("Ungoogled Chromium launched as '{label}'. Waiting for exit...");
+    let _ = child.wait();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — locate/download Ungoogled Chromium binary & query CDP port
+// ---------------------------------------------------------------------------
+
+pub fn find_or_download_chromium(status_file: Option<&Path>) -> Result<PathBuf, String> {
+    write_status(status_file, "Locating Ungoogled Chromium installation...");
+    if let Ok(env_path) = std::env::var("UNGOOGLED_CHROMIUM_PATH") {
+        let p = PathBuf::from(env_path);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    if let Ok(env_path) = std::env::var("CHROMIUM_PATH") {
+        let p = PathBuf::from(env_path);
+        if p.exists() {
+            return Ok(p);
         }
     }
 
-    let event_loop = EventLoopBuilder::<()>::new().build();
+    let data_chrom_dir = crate::data_dir().join("chromium");
+    let appimage_path = data_chrom_dir.join("ungoogled-chromium.AppImage");
+    if appimage_path.exists() {
+        return Ok(appimage_path);
+    }
+    let extracted_binary = data_chrom_dir.join("chrome-linux").join("chrome");
+    if extracted_binary.exists() {
+        return Ok(extracted_binary);
+    }
 
-    let title = if label.is_empty() {
-        "Browsing as account".to_string()
-    } else {
-        format!("Browsing as {label}")
-    };
-    let window = WindowBuilder::new()
-        .with_title(&title)
-        .with_inner_size(tao::dpi::LogicalSize::new(1100.0, 800.0))
-        .build(&event_loop)
-        .map_err(|e| format!("window build: {e}"))?;
+    let system_candidates = [
+        "ungoogled-chromium",
+        "chromium-browser",
+        "chromium",
+        "google-chrome",
+    ];
 
-    let mut web_context = WebContext::new(Some(profile_dir));
+    for candidate in &system_candidates {
+        for prefix in &[
+            "/usr/bin",
+            "/usr/local/bin",
+            "/var/lib/flatpak/exports/bin",
+            "/snap/bin",
+        ] {
+            let sys_path = Path::new(prefix).join(candidate);
+            if sys_path.exists() {
+                return Ok(sys_path);
+            }
+        }
+    }
 
-    // WebView2's CookieManager.CreateCookie quietly stores any cookie whose
-    // Domain attribute matches the host as host-only — Domain=roblox.com never
-    // gets sent to www.roblox.com, and Domain=.roblox.com fares no better. So
-    // we install the cookie from inside roblox.com's own origin via
-    // document.cookie, which the underlying Chromium parser handles per
-    // RFC 6265 (treating any Domain as covering subdomains).
-    //
-    // To avoid flashing the login form, we register the cookie+redirect as an
-    // initialization script that runs BEFORE the page's own scripts. The first
-    // load lands on /login (boot URL), the init script installs the cookie and
-    // immediately `location.replace`s to /home, so the login UI never gets a
-    // chance to render. The init script runs on subsequent navigations too,
-    // but a path check prevents a redirect loop.
-    let cookie_js_literal = serde_json::to_string(&cookie_value)
-        .map_err(|e| format!("serialize cookie for JS: {e}"))?;
-    let boot_path_js = serde_json::to_string(BROWSE_AS_BOOT_PATH).unwrap();
-    let home_url_js = serde_json::to_string(BROWSE_AS_HOME_URL).unwrap();
-    let init_script = format!(
-        r#"(function() {{
-            // 1. Mask the WebGL Renderer (Disguise Mesa Linux drivers as standard NVIDIA Windows/Linux specs)
-            try {{
-                const orgGetParameter = WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function(param) {{
-                    if (param === 37445) return 'NVIDIA Corporation'; // UNMASKED_VENDOR_WEBGL
-                    if (param === 37446) return 'NVIDIA GeForce RTX 4060/PCIe/SSE2'; // UNMASKED_RENDERER_WEBGL
-                    return orgGetParameter.apply(this, arguments);
-                }};
-                if (typeof WebGL2RenderingContext !== 'undefined') {{
-                    const orgGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
-                    WebGL2RenderingContext.prototype.getParameter = function(param) {{
-                        if (param === 37445) return 'NVIDIA Corporation'; // UNMASKED_VENDOR_WEBGL
-                        if (param === 37446) return 'NVIDIA GeForce RTX 4060/PCIe/SSE2'; // UNMASKED_RENDERER_WEBGL
-                        return orgGetParameter2.apply(this, arguments);
-                    }};
-                }}
-            }} catch(e) {{}}
+    info!("Ungoogled Chromium not found on system. Downloading latest release build...");
+    download_ungoogled_chromium(&appimage_path, status_file)?;
+    Ok(appimage_path)
+}
 
-            // 2. Hide Automation Flags
-            try {{
-                Object.defineProperty(navigator, 'webdriver', {{ get: () => false }});
-            }} catch(e) {{}}
+fn download_ungoogled_chromium(target_path: &Path, status_file: Option<&Path>) -> Result<(), String> {
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create chromium dir: {e}"))?;
+    }
 
-            // 3. Normalize Language Arrays
-            try {{
-                Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
-            }} catch(e) {{}}
+    write_status(status_file, "Checking GitHub for latest Ungoogled Chromium release...");
 
-            // 4. Fabricate Realistic Screen Boundaries (Prevents Webview Box detection)
-            try {{
-                Object.defineProperty(Screen.prototype, 'width', {{ get: () => 1920 }});
-                Object.defineProperty(Screen.prototype, 'height', {{ get: () => 1080 }});
-                Object.defineProperty(Screen.prototype, 'colorDepth', {{ get: () => 24 }});
-                Object.defineProperty(Screen.prototype, 'pixelDepth', {{ get: () => 24 }});
-            }} catch(e) {{}}
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("RM4Linux/1.9 (UngoogledChromiumDownloader)")
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("http client build failed: {e}"))?;
 
-            // 5. Fabricate the missing window.chrome object structure
-            try {{
-                window.chrome = {{
-                    app: {{
-                        isInstalled: false,
-                        InstallState: {{ DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }},
-                        RunningState: {{ CAN_RUN: 'can_run', CANNOT_RUN: 'cannot_run', RUNNING: 'running' }}
-                    }},
-                    runtime: {{
-                        OnInstalledReason: {{ CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' }},
-                        OnRestartRequiredReason: {{ APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' }},
-                        PlatformArch: {{ ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }},
-                        PlatformNaclArch: {{ ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }},
-                        PlatformOs: {{ ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' }},
-                        RequestUpdateCheckStatus: {{ NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }}
-                    }}
-                }};
-            }} catch(e) {{}}
+    let api_url =
+        "https://api.github.com/repos/ungoogled-software/ungoogled-chromium-portablelinux/releases/latest";
+    let resp = client
+        .get(api_url)
+        .send()
+        .map_err(|e| format!("failed to query GitHub API: {e}"))?;
 
-            // 6. Mock a genuine Chrome Plugin ecosystem
-            try {{
-                const mockPlugins = [
-                    {{ name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
-                    {{ name: "Chrome PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }},
-                    {{ name: "Chromium PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" }}
-                ];
+    if !resp.status().is_success() {
+        return Err(format!("GitHub API returned HTTP {}", resp.status()));
+    }
 
-                Object.defineProperty(navigator, 'plugins', {{
-                    get: () => {{
-                        const proto = Object.create(PluginArray.prototype);
-                        mockPlugins.forEach((p, i) => {{
-                            const pl = Object.create(Plugin.prototype);
-                            Object.defineProperties(pl, {{
-                                name: {{ get: () => p.name }},
-                                filename: {{ get: () => p.filename }},
-                                description: {{ get: () => p.description }}
-                            }});
-                            proto[i] = pl;
-                            proto[p.name] = pl;
-                        }});
-                        Object.defineProperty(proto, 'length', {{ get: () => mockPlugins.length }});
-                        return proto;
-                    }}
-                }});
-            }} catch(e) {{}}
+    let release_info: Value = resp
+        .json()
+        .map_err(|e| format!("failed to parse GitHub release JSON: {e}"))?;
 
-            // 7. Fake typical Permissions API properties
-            try {{
-                const originalQuery = navigator.permissions.query;
-                navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({{ state: Notification.permission, onchange: null }}) :
-                        originalQuery(parameters)
-                );
-            }} catch(e) {{}}
-        }})();
+    let assets = release_info["assets"]
+        .as_array()
+        .ok_or_else(|| "No assets found in GitHub release".to_string())?;
 
-        (function(){{
-            try {{
-                document.cookie = ".ROBLOSECURITY=" + {cookie_js_literal} +
-                    "; path=/; domain=.roblox.com; secure; samesite=lax";
-            }} catch (e) {{}}
-            try {{
-                if (location.pathname.toLowerCase() === {boot_path_js}) {{
-                    location.replace({home_url_js});
-                }}
-            }} catch (e) {{}}
-        }})();"#,
+    let asset = assets
+        .iter()
+        .find(|a| {
+            let name = a["name"].as_str().unwrap_or_default();
+            name.contains("x86_64") && name.ends_with(".AppImage")
+        })
+        .ok_or_else(|| "No x86_64 AppImage asset found in release".to_string())?;
+
+    let download_url = asset["browser_download_url"]
+        .as_str()
+        .ok_or_else(|| "Missing download URL for asset".to_string())?;
+
+    info!(
+        "Downloading Ungoogled Chromium AppImage from {download_url} to {}",
+        target_path.display()
     );
 
-    let builder = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_url(BROWSE_AS_BOOT_URL)
-        .with_initialization_script(&init_script)
-        .with_user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
-        .with_navigation_handler(|url| {
-            if url.starts_with("roblox-player:") {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&url)
-                    .spawn();
-                false
+    write_status(status_file, "Downloading Ungoogled Chromium AppImage...");
+
+    let mut download_resp = client
+        .get(download_url)
+        .send()
+        .map_err(|e| format!("failed to download ungoogled-chromium AppImage: {e}"))?;
+
+    if !download_resp.status().is_success() {
+        return Err(format!("Download returned HTTP {}", download_resp.status()));
+    }
+
+    let total_bytes = download_resp.content_length().unwrap_or(0);
+    let temp_path = target_path.with_extension("tmp");
+    let mut file = std::fs::File::create(&temp_path)
+        .map_err(|e| format!("failed to create temp file: {e}"))?;
+
+    use std::io::{Read, Write};
+    let mut downloaded_bytes: u64 = 0;
+    let mut buffer = [0u8; 65536];
+    let mut last_update = Instant::now();
+
+    loop {
+        let n = download_resp.read(&mut buffer).map_err(|e| format!("download read error: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buffer[..n]).map_err(|e| format!("write error: {e}"))?;
+        downloaded_bytes += n as u64;
+
+        if last_update.elapsed() >= Duration::from_millis(250) {
+            last_update = Instant::now();
+            let msg = if total_bytes > 0 {
+                let d_mb = downloaded_bytes as f64 / 1_048_576.0;
+                let t_mb = total_bytes as f64 / 1_048_576.0;
+                let pct = (downloaded_bytes as f64 / total_bytes as f64 * 100.0) as u32;
+                format!("Downloading Ungoogled Chromium... ({d_mb:.1} MB / {t_mb:.1} MB - {pct}%)")
             } else {
-                true
-            }
-        });
+                let d_mb = downloaded_bytes as f64 / 1_048_576.0;
+                format!("Downloading Ungoogled Chromium... ({d_mb:.1} MB)")
+            };
+            write_status(status_file, &msg);
+        }
+    }
+
+    write_status(status_file, "Preparing Ungoogled Chromium executable...");
 
     #[cfg(target_os = "linux")]
-    let webview = {
-        use tao::platform::unix::WindowExtUnix;
-        use wry::WebViewBuilderExtUnix;
-        use wry::WebViewExtUnix;
-        use gtk::prelude::*;
-        use webkit2gtk::{WebViewExt, WebContextExt, CookieManagerExt};
-        let vbox = window.default_vbox()
-            .ok_or_else(|| "Failed to get default vbox from window".to_string())?;
-        let wv = builder.build_gtk(vbox)
-            .map_err(|e| format!("webview build: {e}"))?;
-        
-        // Explicitly set cookie policy to Always Allow so session states are preserved
-        if let Some(context) = wv.webview().context() {
-            if let Some(cookie_manager) = context.cookie_manager() {
-                cookie_manager.set_accept_policy(webkit2gtk::CookieAcceptPolicy::Always);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&temp_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(&temp_path, perms);
+    }
+
+    std::fs::rename(&temp_path, target_path)
+        .map_err(|e| format!("failed to save downloaded AppImage: {e}"))?;
+
+    info!(
+        "Successfully downloaded Ungoogled Chromium to {}",
+        target_path.display()
+    );
+    Ok(())
+}
+
+fn get_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap_or(9222)
+}
+
+fn get_cdp_ws_url(port: u16) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let list_url = format!("http://127.0.0.1:{port}/json/list");
+    let version_url = format!("http://127.0.0.1:{port}/json/version");
+    let start = Instant::now();
+
+    while start.elapsed() < Duration::from_secs(15) {
+        // Query /json/list for page target tab
+        if let Ok(resp) = client.get(&list_url).send() {
+            if let Ok(json) = resp.json::<Value>() {
+                if let Some(list) = json.as_array() {
+                    if let Some(target) = list.iter().find(|t| {
+                        t["type"].as_str() == Some("page")
+                            && t["url"]
+                                .as_str()
+                                .map(|u| u.to_lowercase().contains("roblox"))
+                                .unwrap_or(false)
+                    }) {
+                        if let Some(ws) = target["webSocketDebuggerUrl"].as_str() {
+                            return Ok(ws.to_string());
+                        }
+                    }
+                    if let Some(target) = list.iter().find(|t| t["type"].as_str() == Some("page")) {
+                        if let Some(ws) = target["webSocketDebuggerUrl"].as_str() {
+                            return Ok(ws.to_string());
+                        }
+                    }
+                }
             }
         }
-        
-        wv.webview().show();
-        wv
-    };
 
-    #[cfg(not(target_os = "linux"))]
-    let webview = builder.build(&window)
-        .map_err(|e| format!("webview build: {e}"))?;
-
-    info!("browse_as child: entering event loop");
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        // `webview` is moved into this closure so it isn't dropped early —
-        // dropping it would tear down the window.
-        let _ = &webview;
-        if let Event::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } = event
-        {
-            *control_flow = ControlFlow::Exit;
+        // Fall back to /json/version browser target if list isn't ready
+        if let Ok(resp) = client.get(&version_url).send() {
+            if let Ok(json) = resp.json::<Value>() {
+                if let Some(ws) = json["webSocketDebuggerUrl"].as_str() {
+                    return Ok(ws.to_string());
+                }
+            }
         }
-    })
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!("Timed out waiting for CDP endpoint at {list_url}"))
 }
